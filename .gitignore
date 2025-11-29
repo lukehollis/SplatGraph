@@ -107,3 +107,4 @@ Desktop.ini
 
 # Caches
 .cache/
+.env
