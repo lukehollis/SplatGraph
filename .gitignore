@@ -108,3 +108,9 @@ Desktop.ini
 # Caches
 .cache/
 .env
+
+# Test outputs
+output_test/
+
+# Distribution / packaging
+*.egg-info/

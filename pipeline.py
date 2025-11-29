@@ -23,6 +23,7 @@ def main():
     graph_gen = SplatSceneGraph(args.model_path, args.dataset_path, args.output_dir)
     graph_gen.load_model(args.iteration, args.level)
     graph_gen.segment_scene(skip_frames=args.skip_frames)
+    graph_gen.build_hierarchy()
     graph_gen.save_graph("scene_graph_initial.json")
     
     # 2. Predict Physics

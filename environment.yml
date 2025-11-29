@@ -1,0 +1,26 @@
+name: splatgraph
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pytorch
+  - torchvision
+  - torchaudio
+  - tqdm
+  - opencv
+  - matplotlib
+  - typing
+  - scikit-learn
+  - requests
+  - pip:
+    - open-clip-torch
+    - plyfile
+    - jaxtyping
+    - tensorboard
+    - ../LangSplatV2/submodules/segment-anything-langsplat
+    - ../LangSplatV2/submodules/efficient-langsplat-rasterization
+    - ../LangSplatV2/submodules/simple-knn
+    # Note: On Ubuntu/CUDA, ensure pytorch-cuda is installed (e.g., conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia)
