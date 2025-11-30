@@ -4,7 +4,7 @@ import requests
 import base64
 
 class PhysicsPredictor:
-    def __init__(self, api_key, model="google/gemini-2.0-pro-exp-02-05:free"):
+    def __init__(self, api_key, model="x-ai/grok-4.1-fast:free"):
         self.api_key = api_key
         self.model = model
         self.api_url = "https://openrouter.ai/api/v1/chat/completions"
@@ -16,6 +16,15 @@ class PhysicsPredictor:
     def predict(self, object_data):
         image_path = object_data['best_crop_path']
         base64_image = self.encode_image(image_path)
+        
+        # Determine mime type
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext in ['.jpg', '.jpeg']:
+            mime_type = "image/jpeg"
+        elif ext == '.png':
+            mime_type = "image/png"
+        else:
+            mime_type = "image/jpeg" # Default
 
         prompt = """
         Analyze the object in this image and predict its physical properties.
@@ -32,7 +41,9 @@ class PhysicsPredictor:
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/SplatGraph/SplatGraph", # Required by OpenRouter
+            "X-Title": "SplatGraph" # Optional
         }
 
         payload = {
@@ -48,7 +59,7 @@ class PhysicsPredictor:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                "url": f"data:{mime_type};base64,{base64_image}"
                             }
                         }
                     ]
@@ -71,4 +82,6 @@ class PhysicsPredictor:
             return json.loads(content)
         except Exception as e:
             print(f"Error predicting physics for object {object_data['id']}: {e}")
+            if 'response' in locals():
+                print(f"Response content: {response.text}")
             return None
