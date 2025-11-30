@@ -43,13 +43,35 @@ class PhysicsPredictor:
         Analyze the object in the first image (the cropped view). 
         The second image provides the full scene context to help you identify the object and its scale.
         
-        Predict its physical properties and return a JSON object with the following keys:
+        Predict its physical properties for use in a game engine and return a JSON object with the following keys:
         - name: A short name for the object.
         - material: The primary material (e.g., wood, metal, plastic).
         - mass_kg: Estimated mass in kilograms.
         - friction_coefficient: Estimated static friction coefficient (0.0 to 1.0).
         - elasticity: Estimated elasticity/restitution (0.0 to 1.0).
         - description: A brief description of the object.
+        
+        # Core Physics
+        - motion_type: 'static' (e.g., walls, heavy furniture), 'dynamic' (movable props), or 'kinematic' (machinery/doors).
+        - collision_primitive: Best fitting simple collider: 'box', 'sphere', 'capsule', 'cylinder', or 'convex_hull'.
+        - center_of_mass: Approximate location: 'center', 'bottom' (stable), 'top' (unstable).
+
+        # Gameplay / Interaction
+        - destructibility: 'indestructible', 'breakable', or 'explosive'.
+        - health: Estimated health points (1-100) if destructible, else null.
+        - flammability: 0.0 (non-flammable) to 1.0 (highly flammable).
+        - surface_sound: Audio material type: 'wood', 'metal', 'concrete', 'dirt', 'glass', 'plastic', 'fabric'.
+
+        # Visual / Material (PBR)
+        - roughness: 0.0 (smooth/mirror) to 1.0 (matte).
+        - metallic: 0.0 (dielectric) to 1.0 (metal).
+
+        # Dimensions
+        - dimensions: {
+            "length": Estimated length in meters,
+            "width": Estimated width in meters,
+            "height": Estimated height in meters
+          }
         
         Output ONLY the JSON.
         """

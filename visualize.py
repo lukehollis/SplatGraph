@@ -282,7 +282,7 @@ def main():
             label = f"{name} (ID: {obj['id']})"
             
             # Use a folder for the object
-            with server.gui.add_folder(label):
+            with server.gui.add_folder(label, open=False):
                 # Physics Info
                 physics = obj.get('physics', {})
                 md = f"""
