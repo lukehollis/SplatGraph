@@ -6,7 +6,9 @@ import numpy as np
 import torch
 import viser
 import viser.transforms as vtf
+import viser.transforms as vtf
 from plyfile import PlyData
+import time
 
 # Add LangSplatV2 to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../LangSplatV2"))
@@ -129,6 +131,51 @@ def main():
         opacities=opacities,
         covariances=covariances
     )
+    
+    # Splat Click Logic
+    def attach_splat_click(handle):
+        @handle.on_click
+        def _(event):
+            nonlocal selected_object, current_mode
+            if event.instance_index is None: return
+            
+            idx = event.instance_index
+            
+            # Find candidate objects
+            candidates = []
+            for oid, mask in object_masks.items():
+                if idx < len(mask) and mask[idx]:
+                    # Find object data
+                    # Inefficient search, but N is small
+                    # We can cache obj map
+                    obj_data = None
+                    # Search in objects list (recursive)
+                    # Better: build a flat map id->obj
+                    pass
+                    candidates.append(oid)
+            
+            if not candidates: return
+            
+            # Pick the smallest object (fewest splats)
+            # This handles hierarchy (child is smaller than parent)
+            best_oid = None
+            min_count = float('inf')
+            
+            for oid in candidates:
+                count = object_masks[oid].sum()
+                if count < min_count:
+                    min_count = count
+                    best_oid = oid
+            
+            if best_oid:
+                # Find the object dict
+                # We need a map
+                target_obj = object_map.get(best_oid)
+                if target_obj:
+                    selected_object = target_obj
+                    current_mode = "object"
+                    update_info_panel()
+
     print("Added Gaussian Splats to Viser.")
 
     # Load Checkpoint for Language Features
@@ -213,12 +260,56 @@ def main():
     # GUI Elements
     selected_object = None
     object_handles = {} # map id -> handle
+    object_map = {} # map id -> obj dict
+    
+    def build_object_map(objs):
+        for o in objs:
+            object_map[o['id']] = o
+            build_object_map(o.get('children', []))
+    build_object_map(objects)
     
     # State
     current_mode = "object" # "object" or "text"
     current_text_feature = None
     
 
+
+    # Scene Graph Tree GUI
+    print("Building Scene Graph GUI...")
+    with server.gui.add_folder("Scene Graph"):
+        def add_obj_to_gui(obj):
+            name = obj.get('physics', {}).get('name', f"Object {obj['id']}")
+            label = f"{name} (ID: {obj['id']})"
+            
+            # Use a folder for the object
+            with server.gui.add_folder(label):
+                # Physics Info
+                physics = obj.get('physics', {})
+                md = f"""
+                **Physics Properties:**
+                - **Material**: {physics.get('material', 'N/A')}
+                - **Mass**: {physics.get('mass_kg', 'N/A')} kg
+                - **Friction**: {physics.get('friction_coefficient', 'N/A')}
+                - **Elasticity**: {physics.get('elasticity', 'N/A')}
+                - **Description**: {physics.get('description', 'N/A')}
+                """
+                server.gui.add_markdown(md)
+                
+                # Select Button
+                @server.gui.add_button("Select Object").on_click
+                def _(_):
+                    nonlocal selected_object, current_mode
+                    selected_object = obj
+                    current_mode = "object"
+                    # update_info_panel is defined later, but that's fine for callbacks
+                    update_info_panel()
+
+                # Recursively add children
+                for child in obj.get('children', []):
+                    add_obj_to_gui(child)
+
+        for obj in objects:
+            add_obj_to_gui(obj)
 
     # Info Panel
     with server.gui.add_folder("Selected Object Info"):
@@ -311,43 +402,53 @@ def main():
             center = (min_pt + max_pt) / 2
             size = max_pt - min_pt
             
-            # Create box vertices
-            sx, sy, sz = size / 2
-            vertices = np.array([
-                [-sx, -sy, -sz], [sx, -sy, -sz], [sx, sy, -sz], [-sx, sy, -sz],
-                [-sx, -sy, sz], [sx, -sy, sz], [sx, sy, sz], [-sx, sy, sz]
+            # Create box lines (12 lines) using absolute coordinates
+            # We set the node position to (0,0,0) to avoid transform inheritance issues
+            min_x, min_y, min_z = min_pt
+            max_x, max_y, max_z = max_pt
+            
+            # 8 corners
+            c0 = np.array([min_x, min_y, min_z])
+            c1 = np.array([max_x, min_y, min_z])
+            c2 = np.array([max_x, max_y, min_z])
+            c3 = np.array([min_x, max_y, min_z])
+            c4 = np.array([min_x, min_y, max_z])
+            c5 = np.array([max_x, min_y, max_z])
+            c6 = np.array([max_x, max_y, max_z])
+            c7 = np.array([min_x, max_y, max_z])
+            
+            # Pairs
+            lines = np.array([
+                [c0, c1], [c1, c2], [c2, c3], [c3, c0], # Bottom
+                [c4, c5], [c5, c6], [c6, c7], [c7, c4], # Top
+                [c0, c4], [c1, c5], [c2, c6], [c3, c7]  # Vertical
             ])
             
-            # Faces (12 triangles)
-            faces = np.array([
-                [0, 1, 2], [0, 2, 3], # Bottom
-                [4, 5, 6], [4, 6, 7], # Top
-                [0, 1, 5], [0, 5, 4], # Front
-                [2, 3, 7], [2, 7, 6], # Back
-                [1, 2, 6], [1, 6, 5], # Right
-                [0, 3, 7], [0, 7, 4]  # Left
-            ])
-            
-            # Add mesh
-            handle = server.scene.add_mesh_simple(
+            # Add lines to Scene Tree
+            handle = server.scene.add_line_segments(
                 path,
-                vertices=vertices,
-                faces=faces,
-                color=(255, 255, 0), # Yellow
-                wireframe=True,
-                opacity=0.5,
-                position=center
+                points=lines,
+                colors=(255, 255, 0), # Yellow
+                position=(0.0, 0.0, 0.0),
+                wxyz=(1.0, 0.0, 0.0, 0.0)
             )
+            
+            # DEBUG: Add flat wireframe to check coordinates
+            server.scene.add_line_segments(
+                f"/Debug/{node_name}",
+                points=lines,
+                colors=(0, 255, 255), # Cyan for debug
+                position=(0.0, 0.0, 0.0),
+                wxyz=(1.0, 0.0, 0.0, 0.0)
+            )
+            
+            if len(object_handles) < 5:
+                print(f"DEBUG: Added {node_name} bounds: min={min_pt}, max={max_pt}")
             
             object_handles[obj['id']] = handle
             
-            # Click handler
-            @handle.on_click
-            def _(event):
-                nonlocal selected_object, current_mode
-                selected_object = obj
-                current_mode = "object"
-                update_info_panel()
+            # Click handler removed as LineSegmentsHandle doesn't support it.
+            # We rely on splat clicking.
                 
         else:
             server.scene.add_frame(path)
@@ -442,6 +543,9 @@ def main():
                 
         compute_mask_recursive(obj)
     print("Masks computed.")
+    
+    # Attach initial click handler
+    attach_splat_click(splat_handle)
 
     # Callbacks for Language Features
     @query_btn.on_click
@@ -564,6 +668,7 @@ def main():
                 opacities=new_opacities,
                 covariances=covariances
             )
+            attach_splat_click(splat_handle)
             
 if __name__ == "__main__":
     main()

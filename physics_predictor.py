@@ -17,7 +17,7 @@ class PhysicsPredictor:
         image_path = object_data['best_crop_path']
         base64_image = self.encode_image(image_path)
         
-        # Determine mime type
+        # Determine mime type for crop
         ext = os.path.splitext(image_path)[1].lower()
         if ext in ['.jpg', '.jpeg']:
             mime_type = "image/jpeg"
@@ -26,9 +26,24 @@ class PhysicsPredictor:
         else:
             mime_type = "image/jpeg" # Default
 
+        # Handle context image
+        context_path = object_data.get('context_path')
+        base64_context = None
+        context_mime_type = "image/jpeg"
+        
+        if context_path and os.path.exists(context_path):
+            base64_context = self.encode_image(context_path)
+            ext_ctx = os.path.splitext(context_path)[1].lower()
+            if ext_ctx in ['.jpg', '.jpeg']:
+                context_mime_type = "image/jpeg"
+            elif ext_ctx == '.png':
+                context_mime_type = "image/png"
+
         prompt = """
-        Analyze the object in this image and predict its physical properties.
-        Return a JSON object with the following keys:
+        Analyze the object in the first image (the cropped view). 
+        The second image provides the full scene context to help you identify the object and its scale.
+        
+        Predict its physical properties and return a JSON object with the following keys:
         - name: A short name for the object.
         - material: The primary material (e.g., wood, metal, plastic).
         - mass_kg: Estimated mass in kilograms.
@@ -46,23 +61,33 @@ class PhysicsPredictor:
             "X-Title": "SplatGraph" # Optional
         }
 
+        content_list = [
+            {
+                "type": "text",
+                "text": prompt
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{base64_image}"
+                }
+            }
+        ]
+        
+        if base64_context:
+            content_list.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{context_mime_type};base64,{base64_context}"
+                }
+            })
+
         payload = {
             "model": self.model,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_image}"
-                            }
-                        }
-                    ]
+                    "content": content_list
                 }
             ]
         }

@@ -170,15 +170,42 @@ class SplatSceneGraph:
         bg_color = [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
         
-        all_detections = [] # List of {feature, crop_path, view_idx, mask}
+        all_detections = [] # List of {feature, crop_path, view_idx, mask, centroid}
 
         # Create crops directory
         crops_dir = os.path.join(self.output_dir, "crops")
         os.makedirs(crops_dir, exist_ok=True)
+        
+        # Pre-fetch 3D means
+        means3D = self.gaussians.get_xyz
+        ones = torch.ones((means3D.shape[0], 1), device=self.device)
+        means4D = torch.cat((means3D, ones), dim=1)
 
         for i, view in enumerate(tqdm(self.views[::skip_frames])):
             try:
                 rgb, lang_map = self.render_language_feature_map(view, pipeline, background)
+                
+                # Project Gaussians to 2D for this view
+                # P is (4, 4)
+                P = view.full_proj_transform
+                p_hom = means4D @ P
+                p_w = 1.0 / (p_hom[:, 3] + 1e-7)
+                p_proj = p_hom[:, :3] * p_w.unsqueeze(1)
+                
+                # NDC to Pixel
+                u_ndc = p_proj[:, 0]
+                v_ndc = p_proj[:, 1]
+                
+                H, W = view.image_height, view.image_width
+                u_pix = ((u_ndc + 1.0) * W / 2.0)
+                v_pix = ((v_ndc + 1.0) * H / 2.0)
+                
+                # Filter points inside image
+                in_bounds = (u_pix >= 0) & (u_pix < W) & (v_pix >= 0) & (v_pix < H)
+                
+                valid_indices = torch.where(in_bounds)[0]
+                valid_u = u_pix[valid_indices].long()
+                valid_v = v_pix[valid_indices].long()
                 
                 # Convert RGB to numpy for SAM
                 rgb_np = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -188,7 +215,6 @@ class SplatSceneGraph:
                 if self.mask_generator:
                     masks = self.mask_generator.generate(rgb_np)
                     if isinstance(masks, tuple):
-                        # Handle SAM returning a tuple (likely (masks, scores, logits))
                         if len(masks) > 0 and isinstance(masks[0], list):
                             masks = masks[0]
                         elif len(masks) > 0 and isinstance(masks[0], dict):
@@ -202,14 +228,27 @@ class SplatSceneGraph:
                     mask = mask_data['segmentation']
                     
                     # Extract average language feature
-                    # Mask is boolean, lang_map is H,W,C
-                    # We want mean feature over the mask
                     mask_bool = mask.astype(bool)
                     if mask_bool.sum() == 0:
                         continue
                         
                     feature = lang_map_np[mask_bool].mean(axis=0)
                     
+                    # Compute 3D Centroid
+                    # Check which projected points fall into this mask
+                    # mask is (H, W)
+                    # We have valid_u, valid_v for points in bounds
+                    
+                    # Get points that fall in the mask
+                    # mask[v, u] is True
+                    points_in_mask_mask = mask[valid_v.cpu().numpy(), valid_u.cpu().numpy()]
+                    indices_in_mask = valid_indices[torch.tensor(points_in_mask_mask, device=self.device)]
+                    
+                    if len(indices_in_mask) > 0:
+                        centroid = means3D[indices_in_mask].mean(dim=0).cpu().tolist()
+                    else:
+                        centroid = None
+
                     # Save crop
                     x, y, w, h = mask_data['bbox']
                     x, y, w, h = int(x), int(y), int(w), int(h)
@@ -219,12 +258,20 @@ class SplatSceneGraph:
                     crop_path = os.path.join(crops_dir, crop_filename)
                     Image.fromarray(crop).save(crop_path)
                     
+                    # Save context image
+                    context_filename = f"view_{i}_context.png"
+                    context_path = os.path.join(crops_dir, context_filename)
+                    if not os.path.exists(context_path):
+                         Image.fromarray(rgb_np).save(context_path)
+
                     all_detections.append({
                         'feature': feature,
                         'crop_path': crop_path,
+                        'context_path': context_path,
                         'view_idx': i,
                         'bbox': [x, y, w, h],
-                        'area': mask_data['area']
+                        'area': mask_data['area'],
+                        'centroid': centroid
                     })
                 
                 # Free memory after each frame
@@ -268,62 +315,79 @@ class SplatSceneGraph:
             # Pick the best crop (e.g., largest area)
             best_detection = max(obj_detections, key=lambda x: x['area'])
             
+            # Compute mean centroid
+            centroids = [d['centroid'] for d in obj_detections if d['centroid'] is not None]
+            if centroids:
+                mean_centroid = np.mean(centroids, axis=0).tolist()
+            else:
+                mean_centroid = None
+            
             self.objects.append({
                 'id': int(label),
                 'feature': best_detection['feature'].tolist(),
                 'best_crop_path': best_detection['crop_path'],
+                'context_path': best_detection.get('context_path'),
+                'best_view_idx': best_detection['view_idx'],
                 'bbox': best_detection['bbox'], # [x, y, w, h]
                 'area': best_detection['area'],
+                'centroid': mean_centroid,
                 'all_crops': [d['crop_path'] for d in obj_detections],
                 'detection_count': len(obj_detections),
                 'children': []
             })
 
-    def build_hierarchy(self):
+    def build_hierarchy(self, skip_frames=10):
         """
-        Builds a simple hierarchy based on 2D bounding box containment in the best view.
-        This is a heuristic: if object A's bbox contains object B's bbox, B is a child of A.
-        """
-        print("Building scene graph hierarchy...")
+        [DEPRECATED] Builds a hierarchy based on 3D centroid projection.
+        Current default is a flat hierarchy.
         
-        # Sort objects by area (largest first) to find parents first
-        # We want to process from largest to smallest
+        If object A's 2D bbox in A's best view contains object B's projected 3D centroid,
+        then B is a child of A.
+        """
+        print("Building scene graph hierarchy (3D-aware)...")
         sorted_objects = sorted(self.objects, key=lambda x: x['area'], reverse=True)
-        
-        # Map IDs to objects for easy access
-        id_to_obj = {obj['id']: obj for obj in self.objects}
-        
-        # Keep track of which objects are already assigned as children
         assigned_children = set()
-        
-        # Re-construct the list to be hierarchical (only top-level objects)
         root_objects = []
         
         for i, parent in enumerate(sorted_objects):
             if parent['id'] in assigned_children:
                 continue
-                
-            # Check smaller objects to see if they are contained in this parent
-            # We only check objects that haven't been assigned yet
-            # And we only check objects that are strictly smaller
             
             px, py, pw, ph = parent['bbox']
-            parent_rect = (px, py, px + pw, py + ph)
+            
+            # Retrieve parent view
+            # view_idx is the index in the subsampled list
+            view_index_in_full_list = parent['best_view_idx'] * skip_frames
+            if view_index_in_full_list >= len(self.views):
+                # Fallback or error
+                print(f"Warning: View index {view_index_in_full_list} out of bounds.")
+                continue
+                
+            parent_view = self.views[view_index_in_full_list]
+            P = parent_view.full_proj_transform
+            H, W = parent_view.image_height, parent_view.image_width
             
             for child in sorted_objects[i+1:]:
                 if child['id'] in assigned_children:
                     continue
                 
-                cx, cy, cw, ch = child['bbox']
-                child_rect = (cx, cy, cx + cw, cy + ch)
+                if child['centroid'] is None:
+                    continue
+                    
+                # Project child centroid into parent view
+                centroid = torch.tensor(child['centroid'] + [1.0], device=self.device) # (4,)
+                p_hom = centroid @ P
+                p_w = 1.0 / (p_hom[3] + 1e-7)
+                p_proj = p_hom[:3] * p_w
                 
-                # Check containment: child inside parent
-                # Relaxed check: center of child inside parent
-                child_center_x = cx + cw / 2
-                child_center_y = cy + ch / 2
+                u_ndc = p_proj[0]
+                v_ndc = p_proj[1]
                 
-                if (px <= child_center_x <= px + pw) and (py <= child_center_y <= py + ph):
-                    # It's a match!
+                u_pix = ((u_ndc + 1.0) * W / 2.0).item()
+                v_pix = ((v_ndc + 1.0) * H / 2.0).item()
+                
+                # Check containment
+                if (px <= u_pix <= px + pw) and (py <= v_pix <= py + ph):
                     parent['children'].append(child)
                     assigned_children.add(child['id'])
             

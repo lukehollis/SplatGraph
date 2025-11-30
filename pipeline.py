@@ -26,9 +26,7 @@ def main():
     graph_gen = SplatSceneGraph(args.model_path, args.dataset_path, args.output_dir)
     graph_gen.load_model(args.iteration, args.level)
     graph_gen.segment_scene(skip_frames=args.skip_frames)
-    graph_gen.build_hierarchy()
     graph_gen.save_graph("scene_graph_initial.json")
-    
     # 2. Predict Physics
     if args.openrouter_key:
         print("Initializing Physics Predictor...")
@@ -41,10 +39,12 @@ def main():
                 obj['physics'] = physics_props
             else:
                 print(f"Failed to predict physics for object {obj['id']}")
-        
-        graph_gen.save_graph("scene_graph_final.json")
     else:
         print("No OpenRouter key provided. Skipping physics prediction.")
+
+    # graph_gen.build_hierarchy(skip_frames=args.skip_frames)
+    print("Skipping hierarchy building (Flat Graph)...")
+    graph_gen.save_graph("scene_graph_final.json")
 
 if __name__ == "__main__":
     main()
