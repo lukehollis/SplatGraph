@@ -8,13 +8,16 @@ def main():
     parser = argparse.ArgumentParser(description="SplatGraph Pipeline")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset (LangSplatV2 format)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained LangSplatV2 model directory (e.g., data/crate1/langsplat_output/crate1_0_3)")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save results")
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory to save results (default: dataset_path/graphs)")
     parser.add_argument("--openrouter_key", type=str, help="OpenRouter API Key")
     parser.add_argument("--iteration", type=int, default=10000, help="Model iteration to load")
     parser.add_argument("--level", type=int, default=3, help="LangSplatV2 level (1, 2, or 3)")
     parser.add_argument("--skip_frames", type=int, default=10, help="Number of frames to skip during segmentation")
     
     args = parser.parse_args()
+    
+    if args.output_dir is None:
+        args.output_dir = os.path.join(args.dataset_path, "graphs")
     
     os.makedirs(args.output_dir, exist_ok=True)
     

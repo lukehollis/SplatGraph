@@ -210,34 +210,40 @@ def main():
     print(f"Loaded {len(objects)} objects.")
     
     # GUI Elements
-    with server.gui.add_folder("Scene Graph"):
-        obj_names = [f"{obj['id']}: {obj.get('physics', {}).get('name', 'Unknown')}" for obj in objects]
-        obj_map = {name: obj for name, obj in zip(obj_names, objects)}
+    # GUI Elements
+    selected_object = None
+    object_handles = {} # map id -> handle
+    
+    # State
+    current_mode = "object" # "object" or "text"
+    current_text_feature = None
+    
+
+
+    # Info Panel
+    with server.gui.add_folder("Selected Object Info"):
+        info_markdown = server.gui.add_markdown("Click an object in the scene or tree to view details.")
         
-        obj_dropdown = server.gui.add_dropdown(
-            "Select Object",
-            options=obj_names,
-            initial_value=obj_names[0] if obj_names else None
-        )
+        view_btn = server.gui.add_button("View Best Crop")
         
+        @server.gui.add_button("Clear Selection", color="red").on_click
+        def _(_):
+            nonlocal selected_object, current_mode
+            selected_object = None
+            current_mode = "object"
+            update_info_panel()
+            update_visualization()
+
         threshold_slider = server.gui.add_slider(
             "Similarity Threshold",
             min=0.0,
             max=1.0,
             step=0.01,
-            initial_value=0.75
+            initial_value=0.6
         )
-        
-        viz_mode_dropdown = server.gui.add_dropdown(
-            "Visualization Mode",
-            options=["Filter (Opacity)", "Highlight (Color)", "Original"],
-            initial_value="Filter (Opacity)"
-        )
-        
-        info_markdown = server.gui.add_markdown("Select an object to see details.")
-        
-        view_btn = server.gui.add_button("View Best Crop")
-        
+
+    # Language Query GUI
+    print("Setting up Language Query GUI...")
     with server.gui.add_folder("Language Query"):
         query_text = server.gui.add_text(
             "Query",
@@ -249,7 +255,7 @@ def main():
             min=0.0,
             max=1.0,
             step=0.01,
-            initial_value=0.5 # Default to median
+            initial_value=0.5
         )
         
         language_viz_mode_dropdown = server.gui.add_dropdown(
@@ -269,190 +275,175 @@ def main():
             current_text_feature = None
             current_mode = "object"
             query_info.content = "Enter a text query to filter splats."
-            update_visualization()
 
-    # State
-    current_mode = "object" # or "text"
-    current_text_feature = None
-
-    def update_visualization():
-        nonlocal current_mode, splat_handle
-        
+    # Helper to compute 3D bounds
+    def compute_object_bounds(obj, threshold=0.6):
         if gaussian_features is None:
-            return
+            return None
             
-        threshold = 0.5
-        
-        if current_mode == "object":
-            name = obj_dropdown.value
-            if not name: return
-            obj = obj_map[name]
-            
-            # Update Info
-            physics = obj.get('physics', {})
-            md = f"""
-            ### {physics.get('name', 'Object')}
-            - **Material**: {physics.get('material', 'N/A')}
-            - **Mass**: {physics.get('mass_kg', 'N/A')} kg
-            - **Friction**: {physics.get('friction_coefficient', 'N/A')}
-            - **Elasticity**: {physics.get('elasticity', 'N/A')}
-            - **Description**: {physics.get('description', 'N/A')}
-            
-            **Stats**:
-            - Area: {obj.get('area', 0)} px
-            - Detections: {obj.get('detection_count', 0)}
-            """
-            info_markdown.content = md
-            
-            # Object feature
-            target_feature = np.array(obj['feature'])
-            threshold = threshold_slider.value
-            
-        elif current_mode == "text":
-            if current_text_feature is None:
-                return
-            target_feature = current_text_feature
-            info_markdown.content = f"### Query: {query_text.value}"
-            threshold = language_threshold_slider.value
-            
-        # Compute similarity
+        target_feature = np.array(obj['feature'])
         target_feature = target_feature / (np.linalg.norm(target_feature) + 1e-10)
         
-        # gaussian_features: (N, D)
-        # target_feature: (D,)
         sim = gaussian_features @ target_feature
+        mask = sim > threshold
         
-        print(f"Similarity stats: min={sim.min():.4f}, max={sim.max():.4f}, mean={sim.mean():.4f}")
+        if mask.sum() == 0:
+            return None
+            
+        points = xyz[mask]
+        min_pt = points.min(axis=0)
+        max_pt = points.max(axis=0)
         
-        # Percentile-based thresholding for linear sensitivity
-        # Slider value 0.0 -> 0th percentile (Show all)
-        # Slider value 1.0 -> 100th percentile (Show none)
-        # Actually, if we want "Higher slider = Stricter", then:
-        # Threshold = percentile(slider * 100)
-        # mask = sim > Threshold
+        return min_pt, max_pt
+    def add_scene_node(obj, parent_path="/SceneGraph"):
+        nonlocal selected_object
         
-        if current_mode == "text":
-            slider_val = language_threshold_slider.value
-            threshold = np.percentile(sim, slider_val * 100)
+        # Clean name for path
+        safe_name = obj.get('physics', {}).get('name', 'Unknown').replace(" ", "_").replace("/", "-")
+        node_name = f"{obj['id']}_{safe_name}"
+        path = f"{parent_path}/{node_name}"
+        
+        # Compute bounds
+        bounds = compute_object_bounds(obj)
+        
+        if bounds is not None:
+            min_pt, max_pt = bounds
+            center = (min_pt + max_pt) / 2
+            size = max_pt - min_pt
             
-            info_markdown.content = f"""### Query: {query_text.value}
-            **Stats**:
-            - Min: {sim.min():.4f}
-            - Max: {sim.max():.4f}
-            - Mean: {sim.mean():.4f}
-            - Threshold ({slider_val*100:.0f}%): {threshold:.4f}
-            """
+            # Create box vertices
+            sx, sy, sz = size / 2
+            vertices = np.array([
+                [-sx, -sy, -sz], [sx, -sy, -sz], [sx, sy, -sz], [-sx, sy, -sz],
+                [-sx, -sy, sz], [sx, -sy, sz], [sx, sy, sz], [-sx, sy, sz]
+            ])
             
-            lang_mode = language_viz_mode_dropdown.value
+            # Faces (12 triangles)
+            faces = np.array([
+                [0, 1, 2], [0, 2, 3], # Bottom
+                [4, 5, 6], [4, 6, 7], # Top
+                [0, 1, 5], [0, 5, 4], # Front
+                [2, 3, 7], [2, 7, 6], # Back
+                [1, 2, 6], [1, 6, 5], # Right
+                [0, 3, 7], [0, 7, 4]  # Left
+            ])
             
-            mask = sim > threshold
-            print(f"Mask stats: {mask.sum()} / {len(mask)} splats visible ({(mask.sum()/len(mask))*100:.1f}%)")
+            # Add mesh
+            handle = server.scene.add_mesh_simple(
+                path,
+                vertices=vertices,
+                faces=faces,
+                color=(255, 255, 0), # Yellow
+                wireframe=True,
+                opacity=0.5,
+                position=center
+            )
             
-            # Prepare new attributes
-            new_opacities = original_opacities.copy()
-            new_colors = colors.copy()
+            object_handles[obj['id']] = handle
             
-            if lang_mode == "Hide Non-Matches":
-                new_opacities[~mask] = 0
-                
-            elif lang_mode == "Greyscale Non-Matches":
-                # Convert non-matches to greyscale
-                # Greyscale = 0.299*R + 0.587*G + 0.114*B
-                non_match_colors = new_colors[~mask]
-                grey = 0.299 * non_match_colors[:, 0] + 0.587 * non_match_colors[:, 1] + 0.114 * non_match_colors[:, 2]
-                new_colors[~mask] = np.stack([grey, grey, grey], axis=1)
-                # Optional: reduce opacity of non-matches?
-                new_opacities[~mask] *= 0.1
-                
-            elif lang_mode == "Heatmap":
-                # Normalize sim to 0-1 for coloring
-                sim_min, sim_max = sim.min(), sim.max()
-                if sim_max - sim_min > 1e-6:
-                    sim_norm = (sim - sim_min) / (sim_max - sim_min)
-                else:
-                    sim_norm = np.zeros_like(sim)
-                    
-                heatmap_colors = np.zeros_like(colors)
-                heatmap_colors[:, 0] = (1 - sim_norm) # Red
-                heatmap_colors[:, 1] = sim_norm       # Green
-                heatmap_colors[:, 2] = 0              # Blue
-                new_colors = heatmap_colors
+            # Click handler
+            @handle.on_click
+            def _(event):
+                nonlocal selected_object, current_mode
+                selected_object = obj
+                current_mode = "object"
+                update_info_panel()
                 
         else:
-            # Object mode
-            # Prepare new attributes
-            new_opacities = original_opacities.copy()
-            new_colors = colors.copy()
+            server.scene.add_frame(path)
             
-            mode = viz_mode_dropdown.value
-            
-            if mode == "Original":
-                pass 
-            elif mode == "Filter (Opacity)":
-                mask = sim > threshold
-                new_opacities[~mask] = 0
-            elif mode == "Highlight (Color)":
-                # Object mode highlight logic (keep simple for now)
-                pass
-            
-        # Update Splats
-        # Remove and re-add to ensure update
-        splat_handle.remove()
-        splat_handle = server.scene.add_gaussian_splats(
-            "/gaussians",
-            centers=xyz,
-            rgbs=new_colors,
-            opacities=new_opacities,
-            covariances=covariances
-        )
+        # Recursively add children
+        for child in obj.get('children', []):
+            add_scene_node(child, path)
 
-    @obj_dropdown.on_update
-    def _(_):
-        nonlocal current_mode
-        current_mode = "object"
-        update_visualization()
+    def update_info_panel():
+        if selected_object is None: return
+        obj = selected_object
         
-    @threshold_slider.on_update
-    def _(_):
-        update_visualization()
+        physics = obj.get('physics', {})
+        md = f"""
+        ### {physics.get('name', 'Object')} (ID: {obj['id']})
+        - **Material**: {physics.get('material', 'N/A')}
+        - **Mass**: {physics.get('mass_kg', 'N/A')} kg
+        - **Friction**: {physics.get('friction_coefficient', 'N/A')}
+        - **Elasticity**: {physics.get('elasticity', 'N/A')}
+        - **Description**: {physics.get('description', 'N/A')}
         
-    @language_threshold_slider.on_update
-    def _(_):
-        if current_mode == "text":
-            update_visualization()
+        **Stats**:
+        - Area: {obj.get('area', 0)} px
+        - Detections: {obj.get('detection_count', 0)}
+        """
+        info_markdown.content = md
+
+    # Build Scene Tree
+    print("Building Scene Tree...")
+    for obj in objects:
+        add_scene_node(obj)
+    print("Scene Tree built.")
+
+    # Visibility Loop
+    def visibility_loop():
+        while True:
+            # Check visibility of handles
+            # If a handle is hidden, we should hide its splats?
+            # Or rather: We want to show splats for visible objects.
             
-    @language_viz_mode_dropdown.on_update
-    def _(_):
-        if current_mode == "text":
-            update_visualization()
-        
-    @viz_mode_dropdown.on_update
-    def _(_):
-        update_visualization()
-        
-    @view_btn.on_click
-    def _(_):
-        name = obj_dropdown.value
-        if not name: return
-        obj = obj_map[name]
-        
-        crop_path = obj['best_crop_path']
-        try:
-            basename = os.path.basename(crop_path)
-            view_idx = int(basename.split('_')[1])
+            # This is tricky because splats are shared.
+            # If multiple objects claim a splat, and one is hidden, what happens?
+            # Usually, we want to show splats that belong to ANY visible object.
             
-            if 0 <= view_idx < len(train_cameras):
-                cam = train_cameras[view_idx]
-                position = cam.camera_center.cpu().numpy()
-                quat = vtf.SO3.from_matrix(cam.R).wxyz
+            # Let's construct a mask of visible splats.
+            if gaussian_features is not None:
+                visible_mask = np.zeros(len(xyz), dtype=bool)
+                active_objects = False
                 
-                client = server.get_clients()
-                for c in client.values():
-                    c.camera.position = position
-                    c.camera.wxyz = quat
-        except Exception as e:
-            print(f"Error moving camera: {e}")
+                for obj_id, handle in object_handles.items():
+                    if handle.visible:
+                        active_objects = True
+                        # Find object (inefficient to search list every time, but okay for now)
+                        # Better: store obj in handle? No.
+                        # We have obj_id.
+                        # We need the obj data to compute bounds/mask again?
+                        # Re-computing mask every frame is too slow.
+                        # We should cache the masks!
+                        pass
+                
+                # Caching masks
+                # Let's do this outside the loop first.
             
+    # Pre-compute masks for all objects?
+    # Memory usage: N_splats * N_objects bits.
+    # N_splats ~ 1M. N_objects ~ 100.
+    # 100M bits = 12.5 MB. Totally fine.
+    
+    print("Pre-computing object masks...")
+    object_masks = {}
+    for obj in objects:
+        def compute_mask_recursive(o):
+            mask = compute_object_bounds(o, threshold=0.6) # Re-using logic, but we need the mask, not bounds
+            # Wait, compute_object_bounds returns bounds.
+            # Let's refactor compute_object_bounds or just duplicate logic.
+            
+            target_feature = np.array(o['feature'])
+            target_feature = target_feature / (np.linalg.norm(target_feature) + 1e-10)
+            sim = gaussian_features @ target_feature
+            m = sim > 0.6 # Fixed threshold for definition? Or use slider?
+            # Using slider value from GUI? 
+            # If we use slider, we can't pre-compute.
+            # But the bounding boxes are static.
+            # Let's use a fixed threshold for "Object Definition" (bounds and tree).
+            # And maybe dynamic for "Visualization"?
+            # The user wants to toggle visibility.
+            
+            object_masks[o['id']] = m
+            
+            for child in o.get('children', []):
+                compute_mask_recursive(child)
+                
+        compute_mask_recursive(obj)
+    print("Masks computed.")
+
+    # Callbacks for Language Features
     @query_btn.on_click
     def _(_):
         nonlocal current_mode, current_text_feature
@@ -472,21 +463,107 @@ def main():
             current_text_feature = text_embed.cpu().numpy()[0]
             
         current_mode = "text"
-        update_visualization()
         query_info.content = f"Showing results for: **{text}**"
 
+    # Visibility / Update Loop
+    last_visibility_state = {}
+    last_mode = None
+    last_text_params = None
 
+    while True:
+        # Check if update is needed
+        needs_update = False
+        
+        # 1. Check Mode Change
+        if current_mode != last_mode:
+            needs_update = True
+            last_mode = current_mode
+            
+        if current_mode == "object":
+            # Check Scene Tree visibility
+            current_visibility_state = {oid: h.visible for oid, h in object_handles.items()}
+            if current_visibility_state != last_visibility_state:
+                needs_update = True
+                last_visibility_state = current_visibility_state.copy()
+                
+        elif current_mode == "text":
+            # Check text params
+            current_text_params = (
+                language_threshold_slider.value,
+                language_viz_mode_dropdown.value,
+                id(current_text_feature) if current_text_feature is not None else 0
+            )
+            if current_text_params != last_text_params:
+                needs_update = True
+                last_text_params = current_text_params
+        
+        if needs_update:
+            new_opacities = original_opacities.copy()
+            new_colors = colors.copy()
+            
+            if current_mode == "object":
+                # Object Mode Logic
+                visible_mask = np.zeros(len(xyz), dtype=bool)
+                any_visible = False
+                
+                for oid, is_visible in last_visibility_state.items():
+                    if is_visible:
+                        if oid in object_masks:
+                            visible_mask |= object_masks[oid]
+                            any_visible = True
+                
+                if any_visible:
+                    new_opacities[~visible_mask] = 0
+                else:
+                    new_opacities[:] = 0
+                    
+            elif current_mode == "text":
+                # Text Mode Logic
+                if current_text_feature is not None and gaussian_features is not None:
+                    target_feature = current_text_feature
+                    
+                    # Compute similarity
+                    sim = gaussian_features @ target_feature
+                    
+                    # Threshold
+                    slider_val = language_threshold_slider.value
+                    threshold = np.percentile(sim, slider_val * 100)
+                    
+                    mask = sim > threshold
+                    
+                    lang_mode = language_viz_mode_dropdown.value
+                    
+                    if lang_mode == "Hide Non-Matches":
+                        new_opacities[~mask] = 0
+                        
+                    elif lang_mode == "Greyscale Non-Matches":
+                        non_match_colors = new_colors[~mask]
+                        grey = 0.299 * non_match_colors[:, 0] + 0.587 * non_match_colors[:, 1] + 0.114 * non_match_colors[:, 2]
+                        new_colors[~mask] = np.stack([grey, grey, grey], axis=1)
+                        new_opacities[~mask] *= 0.1
+                        
+                    elif lang_mode == "Heatmap":
+                        sim_min, sim_max = sim.min(), sim.max()
+                        if sim_max - sim_min > 1e-6:
+                            sim_norm = (sim - sim_min) / (sim_max - sim_min)
+                        else:
+                            sim_norm = np.zeros_like(sim)
+                            
+                        heatmap_colors = np.zeros_like(colors)
+                        heatmap_colors[:, 0] = (1 - sim_norm) # Red
+                        heatmap_colors[:, 1] = sim_norm       # Green
+                        heatmap_colors[:, 2] = 0              # Blue
+                        new_colors = heatmap_colors
 
-    # Initial update
-    update_visualization()
-
-    # Keep alive
-    import time
-    try:
-        while True:
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        print("Stopping...")
-
+            # Update Splats
+            splat_handle.remove()
+            splat_handle = server.scene.add_gaussian_splats(
+                "/gaussians",
+                centers=xyz,
+                rgbs=new_colors,
+                opacities=new_opacities,
+                covariances=covariances
+            )
+            
 if __name__ == "__main__":
     main()
