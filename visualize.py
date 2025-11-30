@@ -283,49 +283,20 @@ def main():
         initial_value="RGB"
     )
     
-    with server.gui.add_folder("Scene Graph", expand_by_default=False):
-        def add_obj_to_gui(obj):
-            name = obj.get('physics', {}).get('name', f"Object {obj['id']}")
-            label = f"{name} (ID: {obj['id']})"
-            
-            # Use a folder for the object
-            with server.gui.add_folder(label, expand_by_default=False):
-                # Physics Info
-                physics = obj.get('physics', {})
-                md = f"""
-                **Physics Properties:**
-                - **Material**: {physics.get('material', 'N/A')}
-                - **Mass**: {physics.get('mass_kg', 'N/A')} kg
-                - **Friction**: {physics.get('friction_coefficient', 'N/A')}
-                - **Elasticity**: {physics.get('elasticity', 'N/A')}
-                - **Motion Type**: {physics.get('motion_type', 'N/A')}
-                - **Collision**: {physics.get('collision_primitive', 'N/A')}
-                - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
-                - **Destructibility**: {physics.get('destructibility', 'N/A')}
-                - **Health**: {physics.get('health', 'N/A')}
-                - **Flammability**: {physics.get('flammability', 'N/A')}
-                - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
-                - **Roughness**: {physics.get('roughness', 'N/A')}
-                - **Metallic**: {physics.get('metallic', 'N/A')}
-                - **Description**: {physics.get('description', 'N/A')}
-                """
-                server.gui.add_markdown(md)
-                
-                # Select Button
-                @server.gui.add_button("Select Object").on_click
-                def _(_):
-                    nonlocal selected_object, current_mode
-                    selected_object = obj
-                    current_mode = "object"
-                    # update_info_panel is defined later, but that's fine for callbacks
-                    update_info_panel()
+    show_boxes_checkbox = server.gui.add_checkbox(
+        "Show Bounding Boxes",
+        initial_value=True
+    )
+    
+    box_type_dropdown = server.gui.add_dropdown(
+        "Box Type",
+        options=["AABB", "OBB"],
+        initial_value="OBB"
+    )
 
-                # Recursively add children
-                for child in obj.get('children', []):
-                    add_obj_to_gui(child)
-
-        for obj in objects:
-            add_obj_to_gui(obj)
+    # Scene Graph Tree GUI
+    # We will build this dynamically
+    pass
 
     # Info Panel
     with server.gui.add_folder("Selected Object Info"):
@@ -392,15 +363,21 @@ def main():
     obj_id_to_idx = {}
     obj_idx_to_id = []
     obj_features_list = []
+    obj_centroids_list = []
     
     def collect_obj_features(obj):
         feat = np.array(obj['feature'])
         feat = feat / (np.linalg.norm(feat) + 1e-10)
         
+        centroid = obj.get('centroid')
+        if centroid is None:
+            centroid = [0, 0, 0] # Fallback
+            
         idx = len(obj_idx_to_id)
         obj_id_to_idx[obj['id']] = idx
         obj_idx_to_id.append(obj['id'])
         obj_features_list.append(feat)
+        obj_centroids_list.append(centroid)
         
         for child in obj.get('children', []):
             collect_obj_features(child)
@@ -408,139 +385,274 @@ def main():
     for obj in objects:
         collect_obj_features(obj)
         
-    similarity_matrix = None
+    similarity_matrix = None # We will store the BEST match index here instead of full matrix to save RAM?
+    # Actually we need the matrix for "thresholding" logic if we want to support that too.
+    # But for "Argmax", we just need the best index.
+    
+    # Let's store:
+    # 1. best_obj_idx (N,) - The index of the winning object
+    # 2. best_obj_score (N,) - The score of the winner (for thresholding background)
+    
+    best_obj_indices = None
+    best_obj_scores = None
+    
     segmentation_colors = colors.copy()
     
     if gaussian_features is not None and obj_features_list:
         obj_features_np = np.stack(obj_features_list) # (K, D)
+        obj_centroids_np = np.array(obj_centroids_list) # (K, 3)
         
         # Compute on GPU if possible
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Computing similarity matrix on {device}...")
+        print(f"Computing assignment on {device}...")
         
         # Convert to torch
         g_feats_th = torch.from_numpy(gaussian_features).to(device)
         o_feats_th = torch.from_numpy(obj_features_np).float().to(device)
         
-        # Chunked computation to save VRAM
-        # Result (N, K)
+        g_xyz_th = torch.from_numpy(xyz).float().to(device)
+        o_centroids_th = torch.from_numpy(obj_centroids_np).float().to(device)
+        
         N = g_feats_th.shape[0]
         K = o_feats_th.shape[0]
         
-        # We need the full similarity matrix for bounds, but maybe we can just store masks?
-        # N=3M, K=100 => 300M floats = 1.2GB. Acceptable.
-        
-        similarity_matrix = np.zeros((N, K), dtype=np.float32)
+        best_obj_indices = np.zeros(N, dtype=np.int32)
+        best_obj_scores = np.zeros(N, dtype=np.float32)
         
         # Also compute segmentation colors on the fly
         np.random.seed(42)
         obj_color_map = np.random.rand(K, 3)
         
-        chunk_size = 50000 # Adjust based on VRAM
+        chunk_size = 10000 # Smaller chunk size for distance matrix
+        
+        # Spatial Weight: How much does distance penalty matter?
+        # Similarity is [0, 1].
+        # Distance is in meters (e.g., 0 to 10).
+        # We want to penalize far away objects.
+        # Score = Sim - (Dist * lambda)
+        # If lambda = 0.1, then 1 meter away = -0.1 penalty.
+        spatial_weight = 1.0 
         
         for i in range(0, N, chunk_size):
-            g_chunk = g_feats_th[i:i+chunk_size]
-            sim_chunk = g_chunk @ o_feats_th.T # (B, K)
+            g_feat_chunk = g_feats_th[i:i+chunk_size]
+            g_xyz_chunk = g_xyz_th[i:i+chunk_size]
             
-            # Save similarity
-            sim_cpu = sim_chunk.cpu().numpy()
-            similarity_matrix[i:i+chunk_size] = sim_cpu
+            # 1. Feature Similarity (B, K)
+            sim_chunk = g_feat_chunk @ o_feats_th.T
+            
+            # 2. Spatial Distance (B, K)
+            # dist = sqrt((g - o)^2)
+            # Expand dims: (B, 1, 3) - (1, K, 3)
+            dist_chunk = torch.cdist(g_xyz_chunk, o_centroids_th)
+            
+            # 3. Combined Score
+            # We want high similarity and low distance.
+            # Score = Sim - (Dist * weight)
+            score_chunk = sim_chunk - (dist_chunk * spatial_weight)
+            
+            # 4. Argmax
+            best_idx = torch.argmax(score_chunk, dim=1)
+            best_score = torch.max(score_chunk, dim=1).values
+            
+            # For background thresholding, we should look at the RAW similarity of the winner, 
+            # not the penalized score (which could be negative).
+            # Let's retrieve the raw similarity of the winner.
+            # gather: (B, K) -> (B, 1)
+            raw_sim_of_winner = torch.gather(sim_chunk, 1, best_idx.unsqueeze(1)).squeeze(1)
+            
+            # Save to CPU
+            best_obj_indices[i:i+chunk_size] = best_idx.cpu().numpy()
+            best_obj_scores[i:i+chunk_size] = raw_sim_of_winner.cpu().numpy()
             
             # Segmentation Colors
-            best_idx = np.argmax(sim_cpu, axis=1)
-            max_sim = np.max(sim_cpu, axis=1)
-            mask = max_sim > 0.6
+            mask = raw_sim_of_winner > 0.6 # Still use threshold for "is this anything?"
             
-            chunk_colors = obj_color_map[best_idx]
-            chunk_colors[~mask] = [0.5, 0.5, 0.5] # Grey background
+            chunk_colors = obj_color_map[best_idx.cpu().numpy()]
+            chunk_colors[~mask.cpu().numpy()] = [0.5, 0.5, 0.5]
             segmentation_colors[i:i+chunk_size] = chunk_colors
             
         # Clean up GPU
-        del g_feats_th, o_feats_th
+        del g_feats_th, o_feats_th, g_xyz_th, o_centroids_th
         torch.cuda.empty_cache()
         
-    print("Similarity and colors computed.")
+    print("Assignment computed.")
 
     # Helper to compute 3D bounds
-    def compute_object_bounds(obj, threshold=0.6):
-        if similarity_matrix is None:
+    def compute_object_bounds(obj, box_type="OBB", threshold=0.6):
+        if best_obj_indices is None:
             return None
             
         oid = obj['id']
         if oid not in obj_id_to_idx:
             return None
             
-        idx = obj_id_to_idx[oid]
-        sim = similarity_matrix[:, idx]
-        mask = sim > threshold
+        target_idx = obj_id_to_idx[oid]
+        
+        # Mask: Points where this object is the WINNER
+        # AND the score is high enough
+        mask = (best_obj_indices == target_idx) & (best_obj_scores > threshold)
         
         # Filter by opacity to remove invisible floaters
         if opacities is not None:
-            mask = mask & (opacities.flatten() > 0.1)
+            mask = mask & (opacities.flatten() > 0.3)
         
         if mask.sum() < 10:
             return None
             
         points = xyz[mask]
         
-        # Use percentiles
-        min_pt = np.percentile(points, 1, axis=0)
-        max_pt = np.percentile(points, 99, axis=0)
-        
-        return min_pt, max_pt
-        
-    def add_scene_node(obj, parent_path="/SceneGraph"):
-        nonlocal selected_object
-        
-        # Clean name for path
-        safe_name = obj.get('physics', {}).get('name', 'Unknown').replace(" ", "_").replace("/", "-")
-        node_name = f"{obj['id']}_{safe_name}"
-        path = f"{parent_path}/{node_name}"
-        
-        # Compute bounds
-        bounds = compute_object_bounds(obj)
-        
-        if bounds is not None:
-            min_pt, max_pt = bounds
+        if box_type == "AABB":
+            # Use percentiles
+            min_pt = np.percentile(points, 5, axis=0)
+            max_pt = np.percentile(points, 95, axis=0)
+            return min_pt, max_pt, "AABB"
             
-            # Create box lines (12 lines)
-            min_x, min_y, min_z = min_pt
-            max_x, max_y, max_z = max_pt
+        # OBB Logic
+        # Use percentiles to filter outliers before PCA
+        # We want the core shape
+        # Let's take a subset of points for PCA to be robust
+        
+        # 1. Center the points
+        center = points.mean(axis=0)
+        centered_points = points - center
+        
+        # 2. Compute Covariance
+        cov = np.cov(centered_points, rowvar=False)
+        
+        # 3. Eigen decomposition
+        try:
+            evals, evecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            # Fallback to AABB
+            min_pt = np.percentile(points, 5, axis=0)
+            max_pt = np.percentile(points, 95, axis=0)
+            return min_pt, max_pt, "AABB"
             
-            # 8 corners
-            c0 = np.array([min_x, min_y, min_z])
-            c1 = np.array([max_x, min_y, min_z])
-            c2 = np.array([max_x, max_y, min_z])
-            c3 = np.array([min_x, max_y, min_z])
-            c4 = np.array([min_x, min_y, max_z])
-            c5 = np.array([max_x, min_y, max_z])
-            c6 = np.array([max_x, max_y, max_z])
-            c7 = np.array([min_x, max_y, max_z])
+        # Sort by eigenvalues (largest first)
+        idx = np.argsort(evals)[::-1]
+        evecs = evecs[:, idx]
+        
+        # 4. Project points onto principal axes
+        projected = centered_points @ evecs
+        
+        # 5. Find min/max in local frame (using percentiles for robustness)
+        min_proj = np.percentile(projected, 5, axis=0)
+        max_proj = np.percentile(projected, 95, axis=0)
+        
+        # 6. Construct corners in local frame
+        # 8 corners
+        corners_local = []
+        for x in [min_proj[0], max_proj[0]]:
+            for y in [min_proj[1], max_proj[1]]:
+                for z in [min_proj[2], max_proj[2]]:
+                    corners_local.append([x, y, z])
+        corners_local = np.array(corners_local)
+        
+        # 7. Transform back to world
+        corners_world = corners_local @ evecs.T + center
+        
+        return corners_world, None, "OBB"
+        
+    def build_scene_tree(box_type="OBB"):
+        print(f"Building Scene Tree ({box_type})...")
+        
+        # Clear existing handles if any (by removing the folder if possible, or just overwriting)
+        # Viser doesn't support removing folders easily, but we can overwrite nodes.
+        # However, if we switch from OBB to AABB, the node names are the same, so it should update.
+        
+        # Also rebuild the GUI folder? 
+        # The GUI folder "Scene Graph" is for selecting objects, it doesn't depend on geometry.
+        # So we only need to rebuild the 3D scene nodes.
+        
+        def add_scene_node(obj, parent_path="/SceneGraph"):
+            nonlocal selected_object
             
-            # Pairs
-            lines = np.array([
-                [c0, c1], [c1, c2], [c2, c3], [c3, c0], # Bottom
-                [c4, c5], [c5, c6], [c6, c7], [c7, c4], # Top
-                [c0, c4], [c1, c5], [c2, c6], [c3, c7]  # Vertical
-            ])
+            # Clean name for path
+            safe_name = obj.get('physics', {}).get('name', 'Unknown').replace(" ", "_").replace("/", "-")
+            node_name = f"{obj['id']}_{safe_name}"
+            path = f"{parent_path}/{node_name}"
             
-            # Add lines to Scene Tree
-            handle = server.scene.add_line_segments(
-                path,
-                points=lines,
-                colors=(255, 255, 0), # Yellow
-                position=(0.0, 0.0, 0.0),
-                wxyz=(1.0, 0.0, 0.0, 0.0)
-            )
+            # Compute bounds
+            bounds_result = compute_object_bounds(obj, box_type=box_type)
             
-            object_handles[obj['id']] = handle
+            if bounds_result is not None:
+                if bounds_result[2] == "OBB":
+                    corners = bounds_result[0]
+                    # Corners are [c0, c1, c2, c3, c4, c5, c6, c7]
+                    # Based on the generation order:
+                    # x changes slowest, z changes fastest
+                    # 0: 000 (min, min, min)
+                    # 1: 001 (min, min, max)
+                    # 2: 010 (min, max, min)
+                    # 3: 011 (min, max, max)
+                    # 4: 100 (max, min, min)
+                    # 5: 101 (max, min, max)
+                    # 6: 110 (max, max, min)
+                    # 7: 111 (max, max, max)
+                    
+                    c000 = corners[0]
+                    c001 = corners[1]
+                    c010 = corners[2]
+                    c011 = corners[3]
+                    c100 = corners[4]
+                    c101 = corners[5]
+                    c110 = corners[6]
+                    c111 = corners[7]
+                    
+                    # Lines
+                    lines = np.array([
+                        [c000, c100], [c010, c110], [c001, c101], [c011, c111], # X-axis lines
+                        [c000, c010], [c100, c110], [c001, c011], [c101, c111], # Y-axis lines
+                        [c000, c001], [c100, c101], [c010, c011], [c110, c111]  # Z-axis lines
+                    ])
+                    
+                else:
+                    # Fallback AABB
+                    min_pt, max_pt, _ = bounds_result
+                    
+                    # Create box lines (12 lines)
+                    min_x, min_y, min_z = min_pt
+                    max_x, max_y, max_z = max_pt
+                    
+                    # 8 corners
+                    c0 = np.array([min_x, min_y, min_z])
+                    c1 = np.array([max_x, min_y, min_z])
+                    c2 = np.array([max_x, max_y, min_z])
+                    c3 = np.array([min_x, max_y, min_z])
+                    c4 = np.array([min_x, min_y, max_z])
+                    c5 = np.array([max_x, min_y, max_z])
+                    c6 = np.array([max_x, max_y, max_z])
+                    c7 = np.array([min_x, max_y, max_z])
+                    
+                    # Pairs
+                    lines = np.array([
+                        [c0, c1], [c1, c2], [c2, c3], [c3, c0], # Bottom
+                        [c4, c5], [c5, c6], [c6, c7], [c7, c4], # Top
+                        [c0, c4], [c1, c5], [c2, c6], [c3, c7]  # Vertical
+                    ])
+                    
+                # Add lines to Scene Tree
+                handle = server.scene.add_line_segments(
+                    path,
+                    points=lines,
+                    colors=(255, 255, 0), # Yellow
+                    position=(0.0, 0.0, 0.0),
+                    wxyz=(1.0, 0.0, 0.0, 0.0),
+                    visible=show_boxes_checkbox.value
+                )
                 
-        else:
-            server.scene.add_frame(path)
-            
-        # Recursively add children
-        for child in obj.get('children', []):
-            add_scene_node(child, path)
+                object_handles[obj['id']] = handle
+                    
+            else:
+                server.scene.add_frame(path)
+                
+            # Recursively add children
+            for child in obj.get('children', []):
+                add_scene_node(child, path)
+
+        for obj in objects:
+            add_scene_node(obj)
+        print("Scene Tree built.")
 
     def update_info_panel():
         if selected_object is None: return
@@ -571,11 +683,7 @@ def main():
         """
         info_markdown.content = md
 
-    # Build Scene Tree
-    print("Building Scene Tree...")
-    for obj in objects:
-        add_scene_node(obj)
-    print("Scene Tree built.")
+
 
     # Visibility Loop
     def visibility_loop():
@@ -584,10 +692,10 @@ def main():
     # Pre-compute object masks for visibility logic
     print("Pre-computing object masks...")
     object_masks = {}
-    if similarity_matrix is not None:
+    if best_obj_indices is not None:
         for oid, idx in obj_id_to_idx.items():
-            sim = similarity_matrix[:, idx]
-            mask = sim > 0.6
+            # Mask: Winner is this object AND score > 0.6
+            mask = (best_obj_indices == idx) & (best_obj_scores > 0.6)
             object_masks[oid] = mask
     print("Masks computed.")
     
@@ -621,11 +729,31 @@ def main():
     last_mode = None
     last_render_mode = None
     last_text_params = None
+    last_show_boxes = True
+    last_box_type = "OBB"
 
     while True:
         # Check if update is needed
         needs_update = False
         
+        # Check Box Type
+        current_box_type = box_type_dropdown.value
+        if current_box_type != last_box_type:
+            last_box_type = current_box_type
+            build_scene_tree(box_type=current_box_type)
+            # Re-apply visibility
+            for handle in object_handles.values():
+                handle.visible = show_boxes_checkbox.value
+        
+        # Check Box Visibility
+        current_show_boxes = show_boxes_checkbox.value
+        if current_show_boxes != last_show_boxes:
+            last_show_boxes = current_show_boxes
+            # Toggle visibility of all handles
+            for handle in object_handles.values():
+                handle.visible = current_show_boxes
+            # No need to re-render splats for this, just handles
+            
         # 1. Check Mode Change
         if current_mode != last_mode:
             needs_update = True
