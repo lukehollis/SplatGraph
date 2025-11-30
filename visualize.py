@@ -276,13 +276,20 @@ def main():
 
     # Scene Graph Tree GUI
     print("Building Scene Graph GUI...")
-    with server.gui.add_folder("Scene Graph"):
+    
+    render_mode_dropdown = server.gui.add_dropdown(
+        "Render Mode",
+        options=["RGB", "Segmentation"],
+        initial_value="RGB"
+    )
+    
+    with server.gui.add_folder("Scene Graph", expand_by_default=False):
         def add_obj_to_gui(obj):
             name = obj.get('physics', {}).get('name', f"Object {obj['id']}")
             label = f"{name} (ID: {obj['id']})"
             
             # Use a folder for the object
-            with server.gui.add_folder(label, open=False):
+            with server.gui.add_folder(label, expand_by_default=False):
                 # Physics Info
                 physics = obj.get('physics', {})
                 md = f"""
@@ -291,6 +298,15 @@ def main():
                 - **Mass**: {physics.get('mass_kg', 'N/A')} kg
                 - **Friction**: {physics.get('friction_coefficient', 'N/A')}
                 - **Elasticity**: {physics.get('elasticity', 'N/A')}
+                - **Motion Type**: {physics.get('motion_type', 'N/A')}
+                - **Collision**: {physics.get('collision_primitive', 'N/A')}
+                - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
+                - **Destructibility**: {physics.get('destructibility', 'N/A')}
+                - **Health**: {physics.get('health', 'N/A')}
+                - **Flammability**: {physics.get('flammability', 'N/A')}
+                - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
+                - **Roughness**: {physics.get('roughness', 'N/A')}
+                - **Metallic**: {physics.get('metallic', 'N/A')}
                 - **Description**: {physics.get('description', 'N/A')}
                 """
                 server.gui.add_markdown(md)
@@ -332,6 +348,8 @@ def main():
             step=0.01,
             initial_value=0.6
         )
+        
+
 
     # Language Query GUI
     print("Setting up Language Query GUI...")
@@ -367,25 +385,110 @@ def main():
             current_mode = "object"
             query_info.content = "Enter a text query to filter splats."
 
+    # Pre-compute Object Similarities and Segmentation Colors
+    print("Pre-computing object similarities and segmentation colors...")
+    
+    # Maps for O(1) access
+    obj_id_to_idx = {}
+    obj_idx_to_id = []
+    obj_features_list = []
+    
+    def collect_obj_features(obj):
+        feat = np.array(obj['feature'])
+        feat = feat / (np.linalg.norm(feat) + 1e-10)
+        
+        idx = len(obj_idx_to_id)
+        obj_id_to_idx[obj['id']] = idx
+        obj_idx_to_id.append(obj['id'])
+        obj_features_list.append(feat)
+        
+        for child in obj.get('children', []):
+            collect_obj_features(child)
+            
+    for obj in objects:
+        collect_obj_features(obj)
+        
+    similarity_matrix = None
+    segmentation_colors = colors.copy()
+    
+    if gaussian_features is not None and obj_features_list:
+        obj_features_np = np.stack(obj_features_list) # (K, D)
+        
+        # Compute on GPU if possible
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Computing similarity matrix on {device}...")
+        
+        # Convert to torch
+        g_feats_th = torch.from_numpy(gaussian_features).to(device)
+        o_feats_th = torch.from_numpy(obj_features_np).float().to(device)
+        
+        # Chunked computation to save VRAM
+        # Result (N, K)
+        N = g_feats_th.shape[0]
+        K = o_feats_th.shape[0]
+        
+        # We need the full similarity matrix for bounds, but maybe we can just store masks?
+        # N=3M, K=100 => 300M floats = 1.2GB. Acceptable.
+        
+        similarity_matrix = np.zeros((N, K), dtype=np.float32)
+        
+        # Also compute segmentation colors on the fly
+        np.random.seed(42)
+        obj_color_map = np.random.rand(K, 3)
+        
+        chunk_size = 50000 # Adjust based on VRAM
+        
+        for i in range(0, N, chunk_size):
+            g_chunk = g_feats_th[i:i+chunk_size]
+            sim_chunk = g_chunk @ o_feats_th.T # (B, K)
+            
+            # Save similarity
+            sim_cpu = sim_chunk.cpu().numpy()
+            similarity_matrix[i:i+chunk_size] = sim_cpu
+            
+            # Segmentation Colors
+            best_idx = np.argmax(sim_cpu, axis=1)
+            max_sim = np.max(sim_cpu, axis=1)
+            mask = max_sim > 0.6
+            
+            chunk_colors = obj_color_map[best_idx]
+            chunk_colors[~mask] = [0.5, 0.5, 0.5] # Grey background
+            segmentation_colors[i:i+chunk_size] = chunk_colors
+            
+        # Clean up GPU
+        del g_feats_th, o_feats_th
+        torch.cuda.empty_cache()
+        
+    print("Similarity and colors computed.")
+
     # Helper to compute 3D bounds
     def compute_object_bounds(obj, threshold=0.6):
-        if gaussian_features is None:
+        if similarity_matrix is None:
             return None
             
-        target_feature = np.array(obj['feature'])
-        target_feature = target_feature / (np.linalg.norm(target_feature) + 1e-10)
-        
-        sim = gaussian_features @ target_feature
+        oid = obj['id']
+        if oid not in obj_id_to_idx:
+            return None
+            
+        idx = obj_id_to_idx[oid]
+        sim = similarity_matrix[:, idx]
         mask = sim > threshold
         
-        if mask.sum() == 0:
+        # Filter by opacity to remove invisible floaters
+        if opacities is not None:
+            mask = mask & (opacities.flatten() > 0.1)
+        
+        if mask.sum() < 10:
             return None
             
         points = xyz[mask]
-        min_pt = points.min(axis=0)
-        max_pt = points.max(axis=0)
+        
+        # Use percentiles
+        min_pt = np.percentile(points, 1, axis=0)
+        max_pt = np.percentile(points, 99, axis=0)
         
         return min_pt, max_pt
+        
     def add_scene_node(obj, parent_path="/SceneGraph"):
         nonlocal selected_object
         
@@ -399,11 +502,8 @@ def main():
         
         if bounds is not None:
             min_pt, max_pt = bounds
-            center = (min_pt + max_pt) / 2
-            size = max_pt - min_pt
             
-            # Create box lines (12 lines) using absolute coordinates
-            # We set the node position to (0,0,0) to avoid transform inheritance issues
+            # Create box lines (12 lines)
             min_x, min_y, min_z = min_pt
             max_x, max_y, max_z = max_pt
             
@@ -433,22 +533,7 @@ def main():
                 wxyz=(1.0, 0.0, 0.0, 0.0)
             )
             
-            # DEBUG: Add flat wireframe to check coordinates
-            server.scene.add_line_segments(
-                f"/Debug/{node_name}",
-                points=lines,
-                colors=(0, 255, 255), # Cyan for debug
-                position=(0.0, 0.0, 0.0),
-                wxyz=(1.0, 0.0, 0.0, 0.0)
-            )
-            
-            if len(object_handles) < 5:
-                print(f"DEBUG: Added {node_name} bounds: min={min_pt}, max={max_pt}")
-            
             object_handles[obj['id']] = handle
-            
-            # Click handler removed as LineSegmentsHandle doesn't support it.
-            # We rely on splat clicking.
                 
         else:
             server.scene.add_frame(path)
@@ -468,6 +553,16 @@ def main():
         - **Mass**: {physics.get('mass_kg', 'N/A')} kg
         - **Friction**: {physics.get('friction_coefficient', 'N/A')}
         - **Elasticity**: {physics.get('elasticity', 'N/A')}
+        - **Motion Type**: {physics.get('motion_type', 'N/A')}
+        - **Collision**: {physics.get('collision_primitive', 'N/A')}
+        - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
+        - **Destructibility**: {physics.get('destructibility', 'N/A')}
+        - **Health**: {physics.get('health', 'N/A')}
+        - **Flammability**: {physics.get('flammability', 'N/A')}
+        - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
+        - **Roughness**: {physics.get('roughness', 'N/A')}
+        - **Metallic**: {physics.get('metallic', 'N/A')}
+        - **Dimensions**: {physics.get('dimensions', 'N/A')}
         - **Description**: {physics.get('description', 'N/A')}
         
         **Stats**:
@@ -484,64 +579,16 @@ def main():
 
     # Visibility Loop
     def visibility_loop():
-        while True:
-            # Check visibility of handles
-            # If a handle is hidden, we should hide its splats?
-            # Or rather: We want to show splats for visible objects.
+        pass # Not used
             
-            # This is tricky because splats are shared.
-            # If multiple objects claim a splat, and one is hidden, what happens?
-            # Usually, we want to show splats that belong to ANY visible object.
-            
-            # Let's construct a mask of visible splats.
-            if gaussian_features is not None:
-                visible_mask = np.zeros(len(xyz), dtype=bool)
-                active_objects = False
-                
-                for obj_id, handle in object_handles.items():
-                    if handle.visible:
-                        active_objects = True
-                        # Find object (inefficient to search list every time, but okay for now)
-                        # Better: store obj in handle? No.
-                        # We have obj_id.
-                        # We need the obj data to compute bounds/mask again?
-                        # Re-computing mask every frame is too slow.
-                        # We should cache the masks!
-                        pass
-                
-                # Caching masks
-                # Let's do this outside the loop first.
-            
-    # Pre-compute masks for all objects?
-    # Memory usage: N_splats * N_objects bits.
-    # N_splats ~ 1M. N_objects ~ 100.
-    # 100M bits = 12.5 MB. Totally fine.
-    
+    # Pre-compute object masks for visibility logic
     print("Pre-computing object masks...")
     object_masks = {}
-    for obj in objects:
-        def compute_mask_recursive(o):
-            mask = compute_object_bounds(o, threshold=0.6) # Re-using logic, but we need the mask, not bounds
-            # Wait, compute_object_bounds returns bounds.
-            # Let's refactor compute_object_bounds or just duplicate logic.
-            
-            target_feature = np.array(o['feature'])
-            target_feature = target_feature / (np.linalg.norm(target_feature) + 1e-10)
-            sim = gaussian_features @ target_feature
-            m = sim > 0.6 # Fixed threshold for definition? Or use slider?
-            # Using slider value from GUI? 
-            # If we use slider, we can't pre-compute.
-            # But the bounding boxes are static.
-            # Let's use a fixed threshold for "Object Definition" (bounds and tree).
-            # And maybe dynamic for "Visualization"?
-            # The user wants to toggle visibility.
-            
-            object_masks[o['id']] = m
-            
-            for child in o.get('children', []):
-                compute_mask_recursive(child)
-                
-        compute_mask_recursive(obj)
+    if similarity_matrix is not None:
+        for oid, idx in obj_id_to_idx.items():
+            sim = similarity_matrix[:, idx]
+            mask = sim > 0.6
+            object_masks[oid] = mask
     print("Masks computed.")
     
     # Attach initial click handler
@@ -572,6 +619,7 @@ def main():
     # Visibility / Update Loop
     last_visibility_state = {}
     last_mode = None
+    last_render_mode = None
     last_text_params = None
 
     while True:
@@ -599,11 +647,23 @@ def main():
             )
             if current_text_params != last_text_params:
                 needs_update = True
+            if current_text_params != last_text_params:
+                needs_update = True
                 last_text_params = current_text_params
+                
+        # Check Render Mode
+        current_render_mode = render_mode_dropdown.value
+        if current_render_mode != last_render_mode:
+            needs_update = True
+            last_render_mode = current_render_mode
         
         if needs_update:
             new_opacities = original_opacities.copy()
-            new_colors = colors.copy()
+            
+            if current_render_mode == "Segmentation":
+                new_colors = segmentation_colors.copy()
+            else:
+                new_colors = colors.copy()
             
             if current_mode == "object":
                 # Object Mode Logic
