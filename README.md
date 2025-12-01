@@ -10,11 +10,11 @@ The full pipeline consists of the following steps:
 2.  **3D Gaussian Splatting (3DGS) Training**: Reconstructs the scene as a 3D Gaussian Splatting model.
 3.  **LangSplatV2 Training**: Trains a language feature field on top of the 3DGS model, enabling text-based querying and segmentation.
 4.  **Scene Graph Generation**:
-    *   **Visual Analysis**: Renders the scene from multiple views (e.g., every 10th training view).
+    *   **Visual Analysis**: Renders the scene from multiple views.
     *   **Segmentation**: Uses **SAM (Segment Anything Model)** and LangSplat language features to segment objects in 2D views.
     *   **Object Clustering**: Aggregates 2D detections into unique 3D objects using density-based clustering (DBSCAN) on the language features.
-    *   **Physics Prediction**: Uses a VLM (e.g., Gemini via OpenRouter) to analyze the visual appearance of each object and predict physics properties (mass, friction, elasticity, material).
-    *   **Hierarchy Construction**: Builds a hierarchical relationship between objects (e.g., "apple" inside "bowl") based on spatial containment.
+    *   **Physics Prediction**: Uses a VLM (currently **Grok-4.1-fast** via OpenRouter) to analyze the visual appearance of each object (best crop + context) and predict detailed physics properties.
+    *   **Graph Construction**: Builds a scene graph (currently flat, with hierarchy support planned) containing all objects and their properties.
 
 ## Installation
 
@@ -46,32 +46,66 @@ python SplatGraph/pipeline.py \
   --dataset_path data/crate1 \
   --model_path data/crate1/langsplat_output/crate1_0_3 \
   --output_dir results/crate1_graph \
-  --openrouter_key YOUR_OPENROUTER_KEY
+  --openrouter_key YOUR_OPENROUTER_KEY \
+  --iteration 30000 \
+  --level 3
 ```
+
+### Visualization
+
+Visualize the generated scene graph and LangSplat model using the interactive Viser GUI:
+
+```bash
+python SplatGraph/visualize.py \
+  --dataset_path data/crate1 \
+  --model_path data/crate1/langsplat_output/crate1_0_3 \
+  --graph_path results/crate1_graph/scene_graph_final.json \
+  --port 8080
+```
+
+**Features:**
+*   **Scene Graph Tree**: Explore the list of objects. Expand nodes to view detailed **Physics Properties** (Mass, Friction, Material, etc.).
+*   **Bounding Boxes**: Toggle **Show Bounding Boxes** and switch between **AABB** (Axis-Aligned) and **OBB** (Oriented) modes.
+*   **Language Query**: Enter text queries (e.g., "wooden crate") to filter splats.
+    *   **Visualization Modes**: "Hide Non-Matches", "Greyscale Non-Matches", "Heatmap".
+    *   **Threshold**: Adjust the similarity threshold dynamically.
+*   **Object Selection**: Click on any splat in the 3D view to select the corresponding object and view its details in the "Selected Object Info" panel.
+*   **Render Modes**: Switch between standard **RGB** and **Segmentation** view (objects colored by ID).
 
 ## Output
 
-The pipeline produces a `scene_graph.json` file containing the hierarchical scene graph:
+The pipeline produces a `scene_graph_final.json` file containing the scene graph:
 
 ```json
 {
   "objects": [
     {
       "id": 0,
-      "name": "wooden_crate",
       "physics": {
+        "name": "wooden_crate",
         "material": "wood",
         "mass_kg": 5.0,
-        "friction": 0.6,
-        "elasticity": 0.2
+        "friction_coefficient": 0.6,
+        "elasticity": 0.2,
+        "motion_type": "dynamic",
+        "collision_primitive": "box",
+        "center_of_mass": "center",
+        "destructibility": "breakable",
+        "health": 50,
+        "flammability": 0.8,
+        "surface_sound": "wood",
+        "roughness": 0.9,
+        "metallic": 0.0,
+        "dimensions": {
+            "length": 0.5,
+            "width": 0.5,
+            "height": 0.5
+        },
+        "description": "A sturdy wooden crate used for storage."
       },
-      "children": [
-        {
-          "id": 1,
-          "name": "apple",
-          ...
-        }
-      ]
+      "children": [],
+      "best_crop_path": "...",
+      "feature": [...]
     }
   ]
 }

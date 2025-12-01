@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import viser
 import viser.transforms as vtf
-import viser.transforms as vtf
 from plyfile import PlyData
 import time
 
@@ -293,10 +292,50 @@ def main():
         options=["AABB", "OBB"],
         initial_value="OBB"
     )
+    
+    with server.gui.add_folder("Scene Graph", expand_by_default=False):
+        def add_obj_to_gui(obj):
+            name = obj.get('physics', {}).get('name', f"Object {obj['id']}")
+            label = f"{name} (ID: {obj['id']})"
+            
+            # Use a folder for the object
+            with server.gui.add_folder(label, expand_by_default=False):
+                # Physics Info
+                physics = obj.get('physics', {})
+                md = f"""
+                **Physics Properties:**
+                - **Material**: {physics.get('material', 'N/A')}
+                - **Mass**: {physics.get('mass_kg', 'N/A')} kg
+                - **Friction**: {physics.get('friction_coefficient', 'N/A')}
+                - **Elasticity**: {physics.get('elasticity', 'N/A')}
+                - **Motion Type**: {physics.get('motion_type', 'N/A')}
+                - **Collision**: {physics.get('collision_primitive', 'N/A')}
+                - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
+                - **Destructibility**: {physics.get('destructibility', 'N/A')}
+                - **Health**: {physics.get('health', 'N/A')}
+                - **Flammability**: {physics.get('flammability', 'N/A')}
+                - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
+                - **Roughness**: {physics.get('roughness', 'N/A')}
+                - **Metallic**: {physics.get('metallic', 'N/A')}
+                - **Description**: {physics.get('description', 'N/A')}
+                """
+                server.gui.add_markdown(md)
+                
+                # Select Button
+                @server.gui.add_button("Select Object").on_click
+                def _(_):
+                    nonlocal selected_object, current_mode
+                    selected_object = obj
+                    current_mode = "object"
+                    # update_info_panel is defined later, but that's fine for callbacks
+                    update_info_panel()
 
-    # Scene Graph Tree GUI
-    # We will build this dynamically
-    pass
+                # Recursively add children
+                for child in obj.get('children', []):
+                    add_obj_to_gui(child)
+
+        for obj in objects:
+            add_obj_to_gui(obj)
 
     # Info Panel
     with server.gui.add_folder("Selected Object Info"):
@@ -362,8 +401,8 @@ def main():
     # Maps for O(1) access
     obj_id_to_idx = {}
     obj_idx_to_id = []
-    obj_features_list = []
     obj_centroids_list = []
+    obj_features_list = []
     
     def collect_obj_features(obj):
         feat = np.array(obj['feature'])
@@ -407,13 +446,13 @@ def main():
         print(f"Computing assignment on {device}...")
         
         # Convert to torch
-        g_feats_th = torch.from_numpy(gaussian_features).to(device)
+        # g_feats_th = torch.from_numpy(gaussian_features).to(device) # Too large for VRAM
         o_feats_th = torch.from_numpy(obj_features_np).float().to(device)
         
         g_xyz_th = torch.from_numpy(xyz).float().to(device)
         o_centroids_th = torch.from_numpy(obj_centroids_np).float().to(device)
         
-        N = g_feats_th.shape[0]
+        N = gaussian_features.shape[0]
         K = o_feats_th.shape[0]
         
         best_obj_indices = np.zeros(N, dtype=np.int32)
@@ -434,7 +473,8 @@ def main():
         spatial_weight = 1.0 
         
         for i in range(0, N, chunk_size):
-            g_feat_chunk = g_feats_th[i:i+chunk_size]
+            g_feat_chunk_np = gaussian_features[i:i+chunk_size]
+            g_feat_chunk = torch.from_numpy(g_feat_chunk_np).to(device)
             g_xyz_chunk = g_xyz_th[i:i+chunk_size]
             
             # 1. Feature Similarity (B, K)
@@ -471,8 +511,11 @@ def main():
             chunk_colors[~mask.cpu().numpy()] = [0.5, 0.5, 0.5]
             segmentation_colors[i:i+chunk_size] = chunk_colors
             
+            # Free chunk memory
+            del g_feat_chunk, sim_chunk, dist_chunk, score_chunk, best_idx, best_score, raw_sim_of_winner
+            
         # Clean up GPU
-        del g_feats_th, o_feats_th, g_xyz_th, o_centroids_th
+        del o_feats_th, g_xyz_th, o_centroids_th
         torch.cuda.empty_cache()
         
     print("Assignment computed.")
@@ -556,14 +599,6 @@ def main():
     def build_scene_tree(box_type="OBB"):
         print(f"Building Scene Tree ({box_type})...")
         
-        # Clear existing handles if any (by removing the folder if possible, or just overwriting)
-        # Viser doesn't support removing folders easily, but we can overwrite nodes.
-        # However, if we switch from OBB to AABB, the node names are the same, so it should update.
-        
-        # Also rebuild the GUI folder? 
-        # The GUI folder "Scene Graph" is for selecting objects, it doesn't depend on geometry.
-        # So we only need to rebuild the 3D scene nodes.
-        
         def add_scene_node(obj, parent_path="/SceneGraph"):
             nonlocal selected_object
             
@@ -579,16 +614,6 @@ def main():
                 if bounds_result[2] == "OBB":
                     corners = bounds_result[0]
                     # Corners are [c0, c1, c2, c3, c4, c5, c6, c7]
-                    # Based on the generation order:
-                    # x changes slowest, z changes fastest
-                    # 0: 000 (min, min, min)
-                    # 1: 001 (min, min, max)
-                    # 2: 010 (min, max, min)
-                    # 3: 011 (min, max, max)
-                    # 4: 100 (max, min, min)
-                    # 5: 101 (max, min, max)
-                    # 6: 110 (max, max, min)
-                    # 7: 111 (max, max, max)
                     
                     c000 = corners[0]
                     c001 = corners[1]
@@ -683,7 +708,10 @@ def main():
         """
         info_markdown.content = md
 
-
+    # Build Scene Tree
+    print("Building Scene Tree...")
+    build_scene_tree(box_type="OBB")
+    print("Scene Tree built.")
 
     # Visibility Loop
     def visibility_loop():
