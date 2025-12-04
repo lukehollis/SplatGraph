@@ -1,6 +1,18 @@
-# SplatGraph
+
+[Screencast from 2025-11-30 23-22-26.webm](https://github.com/user-attachments/assets/720aabcb-3981-489d-8dcc-e19c9fcbdd9d)
+
+# SplatGraph 
+## [under active development]
 
 **SplatGraph** is a pipeline for generating a hierarchical 3D scene graph with predictive physics properties from a set of input images. It leverages **3D Gaussian Splatting** for scene reconstruction, **LangSplatV2** for open-vocabulary language annotations, and **VLMs (Visual Language Models)** for semantic reasoning and physics property prediction.
+
+Credit to advisement of Heng Yang, Zhutian Chen, Wanhua Li, Hanspeter Pfister, and Alejandro Escontrela who have variously provided guidance to this project on integrating their own projects. Anything of merit is theirs, any shortcomings my own. 
+
+## Development goals 
+- 3d gaussian splat to segmented scene graph 
+- predictive physics properties in scene graph 
+- robotic training in gauss gym with realstic physics for objects, i.e. when picking up a piece of cloth or item wrapped in plastic, segmented 3d gaussians behave as expected in real world 
+
 
 ## Pipeline Overview
 
