@@ -1,5 +1,8 @@
 
-[Screencast from 2025-11-30 23-22-26.webm](https://github.com/user-attachments/assets/720aabcb-3981-489d-8dcc-e19c9fcbdd9d)
+
+
+https://github.com/user-attachments/assets/a8177f27-bfe0-4e23-820e-8c21197851d2
+
 
 # SplatGraph 
 ## [under active development]
