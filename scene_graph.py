@@ -11,59 +11,6 @@ from PIL import Image
 # Add LangSplatV2 to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../LangSplatV2"))
 
-# Mock CUDA modules for macOS/CPU execution if CUDA is not available
-if not torch.cuda.is_available():
-    try:
-        import simple_knn
-    except ImportError:
-        from unittest.mock import MagicMock
-        
-        # Mock simple_knn
-        simple_knn = MagicMock()
-        simple_knn_c = MagicMock()
-        simple_knn.distCUDA2 = MagicMock()
-        simple_knn_c.distCUDA2 = MagicMock()
-        
-        sys.modules["simple_knn"] = simple_knn
-        sys.modules["simple_knn._C"] = simple_knn_c
-        simple_knn._C = simple_knn_c
-        
-        # Mock diff_gaussian_rasterization
-        diff_gaussian_rasterization = MagicMock()
-        diff_gaussian_rasterization_c = MagicMock()
-        
-        # Configure GaussianRasterizer to return dummy tensors
-        def mock_rasterize(*args, **kwargs):
-            dummy_image = torch.zeros((3, 512, 512), dtype=torch.float32)
-            dummy_radii = torch.zeros((100,), dtype=torch.float32)
-            # D must match codebook size (64 based on error)
-            dummy_lang = torch.zeros((64, 512, 512), dtype=torch.float32) 
-            # render() expects: rendered_image, language_feature_weight_map, radii
-            return dummy_image, dummy_lang, dummy_radii
-
-        class MockRasterizerInstance:
-            def __call__(self, *args, **kwargs):
-                return mock_rasterize(*args, **kwargs)
-
-        rasterizer_class = MagicMock()
-        rasterizer_class.return_value = MockRasterizerInstance()
-        
-        diff_gaussian_rasterization.GaussianRasterizer = rasterizer_class
-        diff_gaussian_rasterization.GaussianRasterizationSettings = MagicMock()
-        
-        sys.modules["diff_gaussian_rasterization"] = diff_gaussian_rasterization
-        sys.modules["diff_gaussian_rasterization._C"] = diff_gaussian_rasterization_c
-        diff_gaussian_rasterization._C = diff_gaussian_rasterization_c
-        
-        print("Mocked CUDA modules for macOS compatibility.")
-
-    # Monkey-patch torch.Tensor.cuda to allow running on CPU
-    def no_op_cuda(self, *args, **kwargs):
-        return self
-
-    torch.Tensor.cuda = no_op_cuda
-    print("Monkey-patched torch.Tensor.cuda to run on CPU.")
-
 from scene import Scene
 from gaussian_renderer import GaussianModel, render
 import gaussian_renderer
@@ -96,7 +43,7 @@ class SplatSceneGraph:
         
         self.mask_generator = None
 
-    def load_model(self, iteration=30000, level=3):
+    def load_model(self, iteration=30000, level=3, max_train_views=300):
         """
         Load LangSplatV2 model. 
         For multi-level models (in langsplat_output), level should be 1, 2, or 3.
@@ -115,7 +62,7 @@ class SplatSceneGraph:
         args.images = "images"
         args.resolution = -1
         args.white_background = False
-        args.data_device = self.device
+        args.data_device = "cpu"
         args.eval = True
         args.include_feature = True
         args.quick_render = False
@@ -124,7 +71,7 @@ class SplatSceneGraph:
         self.args = args # Save for render
         
         self.gaussians = GaussianModel(args.sh_degree)
-        self.scene = Scene(args, self.gaussians, load_iteration=iteration, shuffle=False)
+        self.scene = Scene(args, self.gaussians, load_iteration=iteration, shuffle=False, max_train_views=max_train_views)
         
         # Load checkpoint for language features
         checkpoint_path = os.path.join(self.model_path, f"chkpnt{iteration}.pth")
@@ -401,6 +348,3 @@ class SplatSceneGraph:
             json.dump({'objects': self.objects}, f, indent=4)
         print(f"Saved scene graph to {output_path}")
 
-if __name__ == "__main__":
-    # Test stub
-    pass

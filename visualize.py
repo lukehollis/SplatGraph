@@ -102,7 +102,7 @@ def main():
             
     mock_args = MockArgs()
     gaussians = GaussianModel(mock_args.sh_degree)
-    scene = Scene(mock_args, gaussians, load_iteration=args.iteration, shuffle=False)
+    scene = Scene(mock_args, gaussians, load_iteration=args.iteration, shuffle=False, max_train_views=1, max_test_views=1)
     train_cameras = scene.getTrainCameras()
     print(f"Loaded {len(train_cameras)} training cameras.")
     
@@ -123,8 +123,11 @@ def main():
     M = Rs * scales[:, None, :]
     covariances = M @ M.transpose(0, 2, 1)
     
+    # Create root frame
+    server.scene.add_frame("/world", wxyz=(1.0, 0.0, 0.0, 0.0), position=(0.0, 0.0, 0.0))
+
     splat_handle = server.scene.add_gaussian_splats(
-        "/gaussians",
+        "/world/gaussians",
         centers=xyz,
         rgbs=colors,
         opacities=opacities,
@@ -184,49 +187,60 @@ def main():
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
         try:
-            (model_params, _) = torch.load(checkpoint_path, map_location="cpu")
-            # model_params is a tuple.
-            # Index 7: _language_feature_logits
-            # Index 8: _language_feature_codebooks
+            checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+            if isinstance(checkpoint_data, tuple):
+                if len(checkpoint_data) >= 1:
+                    model_params = checkpoint_data[0]
+                else:
+                    model_params = []
+            else:
+                model_params = checkpoint_data
             
             if len(model_params) >= 9:
-                logits = model_params[7]
-                codebooks = model_params[8]
-                
-                if logits is not None and codebooks is not None:
-                    print("Computing per-gaussian language features...")
-                    L, K, D = codebooks.shape
-                    
-                    # Use GPU if available
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    logits = logits.to(device)
-                    codebooks = codebooks.to(device)
-                    
-                    weights_list = []
-                    for i in range(L):
-                        level_logits = logits[:, i*K : (i+1)*K]
-                        level_weights = torch.softmax(level_logits, dim=1)
-                        weights_list.append(level_weights)
-                        
-                    weights = torch.cat(weights_list, dim=1)
-                    codebooks_flat = codebooks.view(-1, D)
-                    
-                    # Compute features
-                    # Split into chunks to avoid OOM if necessary
-                    chunk_size = 100000
-                    num_points = weights.shape[0]
-                    features_list = []
-                    
-                    for i in range(0, num_points, chunk_size):
-                        chunk_weights = weights[i:i+chunk_size]
-                        chunk_features = chunk_weights @ codebooks_flat
-                        chunk_features = chunk_features / (chunk_features.norm(dim=1, keepdim=True) + 1e-10)
-                        features_list.append(chunk_features.detach().cpu())
-                    
-                    gaussian_features = torch.cat(features_list, dim=0).numpy()
-                    print("Computed gaussian features.")
+                # Check if index 7 looks like logits (N, L*K) or max_radii2D (N,)
+                param7 = model_params[7]
+                if isinstance(param7, torch.Tensor) and param7.ndim == 1:
+                    print("Warning: Checkpoint appears to be a standard Gaussian Splatting model (no language features).")
+                    print("         Bounding boxes and language queries will be disabled.")
+                    gaussian_features = None
                 else:
-                    print("Warning: Checkpoint language features are None.")
+                    logits = model_params[7]
+                    codebooks = model_params[8]
+                    
+                    if logits is not None and codebooks is not None:
+                        print("Computing per-gaussian language features...")
+                        L, K, D = codebooks.shape
+                        
+                        # Use GPU if available
+                        device = "cuda" if torch.cuda.is_available() else "cpu"
+                        logits = logits.to(device)
+                        codebooks = codebooks.to(device)
+                        
+                        weights_list = []
+                        for i in range(L):
+                            level_logits = logits[:, i*K : (i+1)*K]
+                            level_weights = torch.softmax(level_logits, dim=1)
+                            weights_list.append(level_weights)
+                            
+                        weights = torch.cat(weights_list, dim=1)
+                        codebooks_flat = codebooks.view(-1, D)
+                        
+                        # Compute features
+                        # Split into chunks to avoid OOM if necessary
+                        chunk_size = 100000
+                        num_points = weights.shape[0]
+                        features_list = []
+                        
+                        for i in range(0, num_points, chunk_size):
+                            chunk_weights = weights[i:i+chunk_size]
+                            chunk_features = chunk_weights @ codebooks_flat
+                            chunk_features = chunk_features / (chunk_features.norm(dim=1, keepdim=True) + 1e-10)
+                            features_list.append(chunk_features.detach().cpu())
+                        
+                        gaussian_features = torch.cat(features_list, dim=0).numpy()
+                        print("Computed gaussian features.")
+                    else:
+                        print("Warning: Checkpoint language features are None.")
             else:
                 print(f"Warning: Checkpoint tuple length {len(model_params)} unexpected.")
         except Exception as e:
@@ -256,7 +270,6 @@ def main():
     print(f"Loaded {len(objects)} objects.")
     
     # GUI Elements
-    # GUI Elements
     selected_object = None
     object_handles = {} # map id -> handle
     object_map = {} # map id -> obj dict
@@ -271,8 +284,6 @@ def main():
     current_mode = "object" # "object" or "text"
     current_text_feature = None
     
-
-
     # Scene Graph Tree GUI
     print("Building Scene Graph GUI...")
     
@@ -292,6 +303,48 @@ def main():
         options=["AABB", "OBB"],
         initial_value="OBB"
     )
+
+    # Transform GUI
+    with server.gui.add_folder("Transform", expand_by_default=False):
+        # Position
+        with server.gui.add_folder("Position"):
+            pos_x = server.gui.add_number("X", initial_value=0.0, step=0.1)
+            pos_y = server.gui.add_number("Y", initial_value=0.0, step=0.1)
+            pos_z = server.gui.add_number("Z", initial_value=0.0, step=0.1)
+        
+        # Rotation
+        with server.gui.add_folder("Rotation"):
+            rot_roll = server.gui.add_slider("Roll", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
+            rot_pitch = server.gui.add_slider("Pitch", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
+            rot_yaw = server.gui.add_slider("Yaw", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
+
+        @server.gui.add_button("Flip Z (Fix Upside Down)").on_click
+        def _(_):
+            # Toggle between 0 and pi for roll (or pitch?)
+            # Usually "upside down" means rotation around X or Z by 180.
+            # Let's try rotating around X by 180 (Roll).
+            current = rot_roll.value
+            if abs(current) < 0.1:
+                rot_roll.value = np.pi
+            else:
+                rot_roll.value = 0.0
+
+    # Update Transform Logic
+    def update_transform():
+        # Update /world frame
+        world_handle = server.scene.add_frame(
+            "/world",
+            position=(pos_x.value, pos_y.value, pos_z.value),
+            wxyz=vtf.SO3.from_rpy_radians(rot_roll.value, rot_pitch.value, rot_yaw.value).wxyz
+        )
+
+    # Bind callbacks
+    pos_x.on_update(lambda _: update_transform())
+    pos_y.on_update(lambda _: update_transform())
+    pos_z.on_update(lambda _: update_transform())
+    rot_roll.on_update(lambda _: update_transform())
+    rot_pitch.on_update(lambda _: update_transform())
+    rot_yaw.on_update(lambda _: update_transform())
     
     with server.gui.add_folder("Scene Graph", expand_by_default=False):
         def add_obj_to_gui(obj):
@@ -364,7 +417,7 @@ def main():
     # Language Query GUI
     print("Setting up Language Query GUI...")
     with server.gui.add_folder("Language Query"):
-        query_text = server.gui.add_text(
+        language_query_text = server.gui.add_text(
             "Query",
             initial_value="",
         )
@@ -390,7 +443,7 @@ def main():
         @server.gui.add_button("Clear Query", hint="Clear text query and reset view").on_click
         def _(_):
             nonlocal current_mode, current_text_feature
-            query_text.value = ""
+            language_query_text.value = ""
             current_text_feature = None
             current_mode = "object"
             query_info.content = "Enter a text query to filter splats."
@@ -523,10 +576,12 @@ def main():
     # Helper to compute 3D bounds
     def compute_object_bounds(obj, box_type="OBB", threshold=0.6):
         if best_obj_indices is None:
+            print(f"DEBUG: best_obj_indices is None for {obj['id']}")
             return None
             
         oid = obj['id']
         if oid not in obj_id_to_idx:
+            print(f"DEBUG: {oid} not in obj_id_to_idx")
             return None
             
         target_idx = obj_id_to_idx[oid]
@@ -537,9 +592,11 @@ def main():
         
         # Filter by opacity to remove invisible floaters
         if opacities is not None:
-            mask = mask & (opacities.flatten() > 0.3)
+            mask = mask & (opacities.flatten() > 0.05)
         
-        if mask.sum() < 10:
+        count = mask.sum()
+        if count < 10:
+            # print(f"DEBUG: {oid} has too few points: {count}")
             return None
             
         points = xyz[mask]
@@ -605,6 +662,10 @@ def main():
             # Clean name for path
             safe_name = obj.get('physics', {}).get('name', 'Unknown').replace(" ", "_").replace("/", "-")
             node_name = f"{obj['id']}_{safe_name}"
+            # Use /world/SceneGraph
+            if parent_path == "/SceneGraph":
+                parent_path = "/world/SceneGraph"
+            
             path = f"{parent_path}/{node_name}"
             
             # Compute bounds
@@ -734,7 +795,7 @@ def main():
     @query_btn.on_click
     def _(_):
         nonlocal current_mode, current_text_feature
-        text = query_text.value
+        text = language_query_text.value
         if not text: return
         
         if clip_model is None:
@@ -760,8 +821,33 @@ def main():
     last_show_boxes = True
     last_box_type = "OBB"
 
+
+    # Settings GUI
+    with server.gui.add_folder("Settings"):
+        opacity_threshold_slider = server.gui.add_slider(
+            "Opacity Threshold",
+            min=0.0,
+            max=1.0,
+            step=0.01,
+            initial_value=0.2
+        )
+        scale_threshold_slider = server.gui.add_slider(
+            "Scale Threshold",
+            min=0.0,
+            max=10.0,
+            step=0.1,
+            initial_value=0.5
+        )
+
+    # Update Loop
+    last_text_params = None
+    last_render_mode = None
+    last_visibility_state = {}
+    last_opacity_threshold = -1.0
+    last_scale_threshold = -1.0
+    
     while True:
-        # Check if update is needed
+        # Check if update needed
         needs_update = False
         
         # Check Box Type
@@ -786,23 +872,21 @@ def main():
         if current_mode != last_mode:
             needs_update = True
             last_mode = current_mode
+        
+        # Check Visibility State
+        current_visibility_state = {oid: h.visible for oid, h in object_handles.items()}
+        if current_visibility_state != last_visibility_state:
+            needs_update = True
+            last_visibility_state = current_visibility_state
             
-        if current_mode == "object":
-            # Check Scene Tree visibility
-            current_visibility_state = {oid: h.visible for oid, h in object_handles.items()}
-            if current_visibility_state != last_visibility_state:
-                needs_update = True
-                last_visibility_state = current_visibility_state.copy()
-                
-        elif current_mode == "text":
-            # Check text params
+        # Check Text Query
+        if current_mode == "text":
             current_text_params = (
+                language_query_text.value,
                 language_threshold_slider.value,
                 language_viz_mode_dropdown.value,
                 id(current_text_feature) if current_text_feature is not None else 0
             )
-            if current_text_params != last_text_params:
-                needs_update = True
             if current_text_params != last_text_params:
                 needs_update = True
                 last_text_params = current_text_params
@@ -812,9 +896,30 @@ def main():
         if current_render_mode != last_render_mode:
             needs_update = True
             last_render_mode = current_render_mode
+
+        # Check Settings
+        current_opacity_threshold = opacity_threshold_slider.value
+        if abs(current_opacity_threshold - last_opacity_threshold) > 1e-6:
+            needs_update = True
+            last_opacity_threshold = current_opacity_threshold
+
+        current_scale_threshold = scale_threshold_slider.value
+        if abs(current_scale_threshold - last_scale_threshold) > 1e-6:
+            needs_update = True
+            last_scale_threshold = current_scale_threshold
         
         if needs_update:
             new_opacities = original_opacities.copy()
+            
+            # Apply Settings Thresholds
+            if current_opacity_threshold > 0:
+                new_opacities[original_opacities < current_opacity_threshold] = 0
+            
+            if current_scale_threshold > 0:
+                # scales is (N, 3)
+                # We can use max scale dimension
+                max_scales = scales.max(axis=1)
+                new_opacities[max_scales > current_scale_threshold] = 0
             
             if current_render_mode == "Segmentation":
                 new_colors = segmentation_colors.copy()
@@ -832,8 +937,20 @@ def main():
                             visible_mask |= object_masks[oid]
                             any_visible = True
                 
+                # Fallback: If no objects detected (handles empty), show everything
+                if not object_handles:
+                    any_visible = True
+                    visible_mask[:] = True
+                
+                print(f"DEBUG: any_visible: {any_visible}")
+                print(f"DEBUG: last_visibility_state len: {len(last_visibility_state)}")
+                print(f"DEBUG: object_masks len: {len(object_masks)}")
+                
                 if any_visible:
-                    new_opacities[~visible_mask] = 0
+                    # Only keep visible objects
+                    # But also respect threshold
+                    mask = ~visible_mask
+                    new_opacities[mask] = 0
                 else:
                     new_opacities[:] = 0
                     
@@ -876,9 +993,17 @@ def main():
                         new_colors = heatmap_colors
 
             # Update Splats
-            splat_handle.remove()
+            # Try in-place update if possible
+            # Viser handles usually support property setters
+            # But add_gaussian_splats returns a GaussianSplatHandle which has .rgbs and .opacities
+            
+            # Update Splats
+            # Force re-creation to ensure Viser updates
+            if splat_handle is not None:
+                splat_handle.remove()
+            
             splat_handle = server.scene.add_gaussian_splats(
-                "/gaussians",
+                "/world/gaussians",
                 centers=xyz,
                 rgbs=new_colors,
                 opacities=new_opacities,

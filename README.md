@@ -34,7 +34,7 @@ Use the provided shell script to run all steps from scratch:
 
 ```bash
 # Run on a specific scene
-./scripts/run_full_pipeline_local.sh data/crate1
+./scripts/run_full_pipeline.sh data/crate1
 ```
 
 ### Running SplatGraph Only
@@ -42,13 +42,7 @@ Use the provided shell script to run all steps from scratch:
 If you already have a trained LangSplat model, you can run the scene graph generation directly:
 
 ```bash
-python SplatGraph/pipeline.py \
-  --dataset_path data/crate1 \
-  --model_path data/crate1/langsplat_output/crate1_0_3 \
-  --output_dir results/crate1_graph \
-  --openrouter_key YOUR_OPENROUTER_KEY \
-  --iteration 30000 \
-  --level 3
+./scripts/06_splatgraph.sh data/crate1
 ```
 
 ### Visualization

@@ -1,10 +1,14 @@
 import argparse
 import os
 import json
+from dotenv import load_dotenv
 from scene_graph import SplatSceneGraph
 from physics_predictor import PhysicsPredictor
 
 def main():
+    # Load environment variables from .env file
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="SplatGraph Pipeline")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset (LangSplatV2 format)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained LangSplatV2 model directory (e.g., data/crate1/langsplat_output/crate1_0_3)")
@@ -28,9 +32,13 @@ def main():
     graph_gen.segment_scene(skip_frames=args.skip_frames)
     graph_gen.save_graph("scene_graph_initial.json")
     # 2. Predict Physics
-    if args.openrouter_key:
+    
+    # Determine OpenRouter Key
+    openrouter_key = args.openrouter_key or os.getenv("OPENROUTER_API_KEY")
+    
+    if openrouter_key:
         print("Initializing Physics Predictor...")
-        predictor = PhysicsPredictor(args.openrouter_key)
+        predictor = PhysicsPredictor(openrouter_key)
         
         for obj in graph_gen.objects:
             print(f"Predicting physics for object {obj['id']}...")
@@ -40,7 +48,7 @@ def main():
             else:
                 print(f"Failed to predict physics for object {obj['id']}")
     else:
-        print("No OpenRouter key provided. Skipping physics prediction.")
+        print("No OpenRouter key provided (checked args and .env). Skipping physics prediction.")
 
     # graph_gen.build_hierarchy(skip_frames=args.skip_frames)
     print("Skipping hierarchy building (Flat Graph)...")
