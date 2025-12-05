@@ -1,6 +1,8 @@
 # SplatGraph
 
-**SplatGraph** is a pipeline for generating a hierarchical 3D scene graph with predictive physics properties from a set of input images. It leverages **3D Gaussian Splatting** for scene reconstruction, **LangSplatV2** for open-vocabulary language annotations, and **VLMs (Visual Language Models)** for semantic reasoning and physics property prediction.
+SplatGraph is a pipeline for generating a hierarchical 3D scene graph with predictive physics properties from a set of input images. It uses the original 3D Gaussian Splatting implementation for scene reconstruction, LangSplatV2 for open-vocabulary language annotations, and VLMs (Visual Language Models) for semantic reasoning and physics property prediction.
+
+It then represents the annotated scene in [GaussGym](https://escontrela.me/gauss_gym/), which combines Nerfstudio's Viser and NVIDIA IsaacGym, for machine learning and autonomous training. This means that agents within the environment can pickup or manipulate segmented objects in the scene based on the predicted physics properties. 
 
 ## Pipeline Overview
 
