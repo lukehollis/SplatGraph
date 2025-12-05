@@ -18,6 +18,10 @@ Credit to advisement of Heng Yang, Zhutian Chen, Wanhua Li, Hanspeter Pfister, a
 - predictive physics properties in scene graph 
 - robotic training in gauss gym with realstic physics for objects, i.e. when picking up a piece of cloth or item wrapped in plastic, segmented 3d gaussians behave as expected in real world 
 
+## Example Data 
+
+Given an input dataset, such as `figurines` from [LangSplatv2](https://langsplat-v2.github.io/), this package makes an output format that looks like this: https://gist.github.com/lukehollis/be00265e4ec8e22d7eb87695fc0db178
+
 
 ## Pipeline Overview
 
