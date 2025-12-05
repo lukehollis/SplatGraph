@@ -15,12 +15,6 @@ from scene import Scene
 from gaussian_renderer import GaussianModel, render
 import gaussian_renderer
 
-# Force patch GaussianRasterizer in gaussian_renderer ONLY if we are mocking
-if not torch.cuda.is_available() and isinstance(sys.modules.get("diff_gaussian_rasterization"), MagicMock):
-    print(f"DEBUG: gaussian_renderer.GaussianRasterizer is {gaussian_renderer.GaussianRasterizer}")
-    gaussian_renderer.GaussianRasterizer = rasterizer_class
-    print(f"DEBUG: Patched gaussian_renderer.GaussianRasterizer to {gaussian_renderer.GaussianRasterizer}")
-
 from arguments import ModelParams, PipelineParams
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
@@ -89,7 +83,7 @@ class SplatSceneGraph:
         self.views = self.scene.getTrainCameras()
         
         # Initialize SAM
-        # Note: We might need to download the checkpoint if not present
+        # Download the checkpoint if not present
         if os.path.exists(self.sam_checkpoint):
             sam = sam_model_registry["vit_h"](checkpoint=self.sam_checkpoint)
             sam.to(device=self.device)
@@ -285,11 +279,13 @@ class SplatSceneGraph:
 
     def build_hierarchy(self, skip_frames=10):
         """
-        [DEPRECATED] Builds a hierarchy based on 3D centroid projection.
+        This currently isn't used -- but conceptually I think it would be better
+        to add back in. 
+
+        Builds a hierarchy based on 3D centroid projection.
         Current default is a flat hierarchy.
         
-        If object A's 2D bbox in A's best view contains object B's projected 3D centroid,
-        then B is a child of A.
+        If object A's 2D bbox in A's best view contains object B's projected 3D centroid, then B is a child of A.
         """
         print("Building scene graph hierarchy (3D-aware)...")
         sorted_objects = sorted(self.objects, key=lambda x: x['area'], reverse=True)
