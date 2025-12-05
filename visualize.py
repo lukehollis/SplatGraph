@@ -388,8 +388,6 @@ def main():
             step=0.01,
             initial_value=0.6
         )
-        
-
 
     # Language Query GUI
     print("Setting up Language Query GUI...")
@@ -440,7 +438,7 @@ def main():
         
         centroid = obj.get('centroid')
         if centroid is None:
-            centroid = [0, 0, 0] # Fallback
+            centroid = [0, 0, 0] 
             
         idx = len(obj_idx_to_id)
         obj_id_to_idx[obj['id']] = idx
@@ -454,11 +452,7 @@ def main():
     for obj in objects:
         collect_obj_features(obj)
         
-    similarity_matrix = None # We will store the BEST match index here instead of full matrix to save RAM?
-    # Actually we need the matrix for "thresholding" logic if we want to support that too.
-    # But for "Argmax", we just need the best index.
-    
-    # Let's store:
+    similarity_matrix = None # We will store the BEST match index here instead of full matrix 
     # 1. best_obj_idx (N,) - The index of the winning object
     # 2. best_obj_score (N,) - The score of the winner (for thresholding background)
     
@@ -797,7 +791,6 @@ def main():
     last_text_params = None
     last_show_boxes = True
     last_box_type = "OBB"
-
 
     # Settings GUI
     with server.gui.add_folder("Settings"):
