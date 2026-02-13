@@ -36,11 +36,9 @@ def main():
     graph_gen.load_model(args.iteration, args.level)
     graph_gen.segment_scene(skip_frames=args.skip_frames, cluster_eps=args.cluster_eps)
     graph_gen.save_graph("scene_graph_initial.json")
+
     # 2. Predict Physics
-    
-    # Determine OpenRouter Key
     openrouter_key = args.openrouter_key or os.getenv("OPENROUTER_API_KEY")
-    
     if openrouter_key:
         print("Initializing Physics Predictor...")
         predictor = PhysicsPredictor(openrouter_key)
@@ -56,7 +54,6 @@ def main():
     else:
         print("No OpenRouter key provided (checked args and .env). Skipping physics prediction.")
 
-    # graph_gen.build_hierarchy(skip_frames=args.skip_frames)
     print("Skipping hierarchy building (Flat Graph)...")
     graph_gen.save_graph("scene_graph_final.json")
 

@@ -16,24 +16,10 @@ from sklearn.cluster import DBSCAN
 # Add LangSplatV2 to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../LangSplatV2"))
 
-# Mock CUDA modules if necessary (copied from scene_graph.py)
-if not torch.cuda.is_available():
-    try:
-        import simple_knn
-    except ImportError:
-        from unittest.mock import MagicMock
-        sys.modules["simple_knn"] = MagicMock()
-        sys.modules["diff_gaussian_rasterization"] = MagicMock()
-        print("Mocked CUDA modules for CPU execution.")
+from scene import Scene
+from gaussian_renderer import GaussianModel
+from arguments import ModelParams
 
-# Import Scene and Arguments
-try:
-    from scene import Scene
-    from gaussian_renderer import GaussianModel
-    from arguments import ModelParams
-except ImportError as e:
-    print(f"Error importing LangSplat modules: {e}")
-    sys.exit(1)
 
 def load_ply(path):
     plydata = PlyData.read(path)
@@ -70,9 +56,9 @@ def load_ply(path):
     rot_1 = plydata.elements[0]["rot_1"]
     rot_2 = plydata.elements[0]["rot_2"]
     rot_3 = plydata.elements[0]["rot_3"]
-    # 3DGS usually stores as w, x, y, z or x, y, z, w?
+
+    # 3DGS usually stores as w, x, y, z 
     # GaussianModel.py: rot_names = [rot_0, rot_1, rot_2, rot_3]
-    # It seems to be w, x, y, z based on common 3DGS implementations.
     quats = np.stack((rot_0, rot_1, rot_2, rot_3), axis=1)
     
     return xyz, colors, scales, quats, opacities
@@ -157,8 +143,9 @@ def main():
                     # Inefficient search, but N is small
                     # We can cache obj map
                     obj_data = None
+
                     # Search in objects list (recursive)
-                    # Better: build a flat map id->obj
+                    # TODO: build a flat map id->obj
                     pass
                     candidates.append(oid)
             
@@ -190,80 +177,70 @@ def main():
     
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}...")
-        try:
-            checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
-            if isinstance(checkpoint_data, tuple):
-                if len(checkpoint_data) >= 1:
-                    model_params = checkpoint_data[0]
-                else:
-                    model_params = []
+        checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+
+        if isinstance(checkpoint_data, tuple):
+            if len(checkpoint_data) >= 1:
+                model_params = checkpoint_data[0]
             else:
-                model_params = checkpoint_data
-            
-            if len(model_params) >= 9:
-                # Check if index 7 looks like logits (N, L*K) or max_radii2D (N,)
-                param7 = model_params[7]
-                if isinstance(param7, torch.Tensor) and param7.ndim == 1:
-                    print("Warning: Checkpoint appears to be a standard Gaussian Splatting model (no language features).")
-                    print("         Bounding boxes and language queries will be disabled.")
-                    gaussian_features = None
-                else:
-                    logits = model_params[7]
-                    codebooks = model_params[8]
+                model_params = []
+        else:
+            model_params = checkpoint_data
+        
+        if len(model_params) >= 9:
+            # Check if index 7 looks like logits (N, L*K) or max_radii2D (N,)
+            param7 = model_params[7]
+            if isinstance(param7, torch.Tensor) and param7.ndim == 1:
+                print("Warning: Checkpoint appears to be a standard Gaussian Splatting model (no language features).")
+                print("         Bounding boxes and language queries will be disabled.")
+                gaussian_features = None
+            else:
+                logits = model_params[7]
+                codebooks = model_params[8]
+                
+                if logits is not None and codebooks is not None:
+                    print("Computing per-gaussian language features...")
+                    L, K, D = codebooks.shape
                     
-                    if logits is not None and codebooks is not None:
-                        print("Computing per-gaussian language features...")
-                        L, K, D = codebooks.shape
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    logits = logits.to(device)
+                    codebooks = codebooks.to(device)
+                    
+                    weights_list = []
+                    for i in range(L):
+                        level_logits = logits[:, i*K : (i+1)*K]
+                        level_weights = torch.softmax(level_logits, dim=1)
+                        weights_list.append(level_weights)
                         
-                        # Use GPU if available
-                        device = "cuda" if torch.cuda.is_available() else "cpu"
-                        logits = logits.to(device)
-                        codebooks = codebooks.to(device)
-                        
-                        weights_list = []
-                        for i in range(L):
-                            level_logits = logits[:, i*K : (i+1)*K]
-                            level_weights = torch.softmax(level_logits, dim=1)
-                            weights_list.append(level_weights)
-                            
-                        weights = torch.cat(weights_list, dim=1)
-                        codebooks_flat = codebooks.view(-1, D)
-                        
-                        # Compute features
-                        # Split into chunks to avoid OOM if necessary
-                        chunk_size = 100000
-                        num_points = weights.shape[0]
-                        features_list = []
-                        
-                        for i in range(0, num_points, chunk_size):
-                            chunk_weights = weights[i:i+chunk_size]
-                            chunk_features = chunk_weights @ codebooks_flat
-                            chunk_features = chunk_features / (chunk_features.norm(dim=1, keepdim=True) + 1e-10)
-                            features_list.append(chunk_features.detach().cpu())
-                        
-                        gaussian_features = torch.cat(features_list, dim=0).numpy()
-                        print("Computed gaussian features.")
-                    else:
-                        print("Warning: Checkpoint language features are None.")
-            else:
-                print(f"Warning: Checkpoint tuple length {len(model_params)} unexpected.")
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
+                    weights = torch.cat(weights_list, dim=1)
+                    codebooks_flat = codebooks.view(-1, D)
+                    
+                    # Compute features
+                    # Split into chunks to avoid OOM if necessary
+                    chunk_size = 100000
+                    num_points = weights.shape[0]
+                    features_list = []
+                    
+                    for i in range(0, num_points, chunk_size):
+                        chunk_weights = weights[i:i+chunk_size]
+                        chunk_features = chunk_weights @ codebooks_flat
+                        chunk_features = chunk_features / (chunk_features.norm(dim=1, keepdim=True) + 1e-10)
+                        features_list.append(chunk_features.detach().cpu())
+                    
+                    gaussian_features = torch.cat(features_list, dim=0).numpy()
+                    print("Computed gaussian features.")
+                else:
+                    print("Warning: Checkpoint language features are None.")
+        else:
+            print(f"Warning: Checkpoint tuple length {len(model_params)} unexpected.")
     else:
         print(f"Warning: Checkpoint not found at {checkpoint_path}")
 
     # Load OpenCLIP
     print("Loading OpenCLIP...")
-    try:
-        from eval.openclip_encoder import OpenCLIPNetwork
-        clip_model = OpenCLIPNetwork(device="cuda" if torch.cuda.is_available() else "cpu")
-        print("OpenCLIP loaded.")
-    except ImportError:
-        print("Error importing OpenCLIPNetwork. Make sure LangSplatV2 is in path.")
-        clip_model = None
-    except Exception as e:
-        print(f"Error loading OpenCLIP: {e}")
-        clip_model = None
+    from eval.openclip_encoder import OpenCLIPNetwork
+    clip_model = OpenCLIPNetwork(device="cuda" if torch.cuda.is_available() else "cpu")
+    print("OpenCLIP loaded.")
 
     # Load Scene Graph
     objects = []
@@ -407,7 +384,13 @@ def main():
             add_obj_to_gui(obj)
 
 
-        
+        threshold_slider = server.gui.add_slider(
+            "Similarity Threshold",
+            min=0.0,
+            max=1.0,
+            step=0.01,
+            initial_value=0.6
+        )
     # Language Query GUI
     print("Setting up Language Query GUI...")
     with server.gui.add_folder("Language Query"):
@@ -457,7 +440,7 @@ def main():
         
         centroid = obj.get('centroid')
         if centroid is None:
-            centroid = [0, 0, 0] # Fallback
+            centroid = [0, 0, 0] 
             
         idx = len(obj_idx_to_id)
         obj_id_to_idx[obj['id']] = idx
@@ -471,11 +454,7 @@ def main():
     for obj in objects:
         collect_obj_features(obj)
         
-    similarity_matrix = None # We will store the BEST match index here instead of full matrix to save RAM?
-    # Actually we need the matrix for "thresholding" logic if we want to support that too.
-    # But for "Argmax", we just need the best index.
-    
-    # Let's store:
+    similarity_matrix = None # We will store the BEST match index here instead of full matrix 
     # 1. best_obj_idx (N,) - The index of the winning object
     # 2. best_obj_score (N,) - The score of the winner (for thresholding background)
     
@@ -715,7 +694,6 @@ def main():
     last_text_params = None
     last_show_boxes = True
     last_box_type = "OBB"
-
 
     # Settings GUI
     with server.gui.add_folder("Settings"):

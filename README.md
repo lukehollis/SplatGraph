@@ -1,6 +1,27 @@
-# SplatGraph
 
-**SplatGraph** is a pipeline for generating a hierarchical 3D scene graph with predictive physics properties from a set of input images. It leverages **3D Gaussian Splatting** for scene reconstruction, **LangSplatV2** for open-vocabulary language annotations, and **VLMs (Visual Language Models)** for semantic reasoning and physics property prediction.
+
+
+https://github.com/user-attachments/assets/a8177f27-bfe0-4e23-820e-8c21197851d2
+
+
+# SplatGraph 
+[under active development]
+
+SplatGraph is a pipeline for generating a hierarchical 3D scene graph with predictive physics properties from a set of input images. It uses the original [3D Gaussian Splatting implementation](https://github.com/graphdeco-inria/gaussian-splatting) for scene reconstruction, [LangSplatV2](https://langsplat-v2.github.io/) for open-vocabulary language annotations, and VLMs for physics property prediction.
+
+It then represents the annotated scene in [GaussGym](https://escontrela.me/gauss_gym/), which combines Nerfstudio's Viser and NVIDIA IsaacGym, for machine learning and autonomous training. This means that agents within the environment can pickup or manipulate segmented objects in the scene based on the predicted physics properties. 
+
+Credit to advisement of Heng Yang, Zhutian Chen, Wanhua Li, Hanspeter Pfister, and Alejandro Escontrela who have provided guidance to this project and on integrating their own projects. Anything of merit is theirs, any shortcomings my own. 
+
+## Development goals 
+- 3d gaussian splat to segmented scene graph 
+- predictive physics properties in scene graph 
+- robotic training in gauss gym with realstic physics for objects, i.e. when picking up a piece of cloth or item wrapped in plastic, segmented 3d gaussians behave as expected in real world 
+
+## Example Data 
+
+Given an input dataset, such as `figurines` from [LangSplatv2](https://langsplat-v2.github.io/), this package makes an output format that looks like this: https://gist.github.com/lukehollis/be00265e4ec8e22d7eb87695fc0db178
+
 
 ## Pipeline Overview
 
