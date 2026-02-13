@@ -114,3 +114,6 @@ output_test/
 
 # Distribution / packaging
 *.egg-info/
+
+sam-3d-objects
+TripoSR

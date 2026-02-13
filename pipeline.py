@@ -1,4 +1,5 @@
 import argparse
+import sys
 import os
 import json
 from dotenv import load_dotenv
@@ -7,7 +8,9 @@ from physics_predictor import PhysicsPredictor
 
 def main():
     # Load environment variables from .env file
-    load_dotenv()
+    # Load environment variables from .env file (in the same directory as this script)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    load_dotenv(os.path.join(script_dir, ".env"))
 
     parser = argparse.ArgumentParser(description="SplatGraph Pipeline")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset (LangSplatV2 format)")
@@ -17,6 +20,8 @@ def main():
     parser.add_argument("--iteration", type=int, default=10000, help="Model iteration to load")
     parser.add_argument("--level", type=int, default=3, help="LangSplatV2 level (1, 2, or 3)")
     parser.add_argument("--skip_frames", type=int, default=10, help="Number of frames to skip during segmentation")
+    parser.add_argument("--cluster_eps", type=float, default=0.1, help="DBSCAN epsilon for object clustering (default 0.1)")
+    parser.add_argument("--fill_backsides", action="store_true", help="Enable Generative Fill for object backsides")
     
     args = parser.parse_args()
     
@@ -29,7 +34,7 @@ def main():
     print("Initializing Scene Graph Generator...")
     graph_gen = SplatSceneGraph(args.model_path, args.dataset_path, args.output_dir)
     graph_gen.load_model(args.iteration, args.level)
-    graph_gen.segment_scene(skip_frames=args.skip_frames)
+    graph_gen.segment_scene(skip_frames=args.skip_frames, cluster_eps=args.cluster_eps)
     graph_gen.save_graph("scene_graph_initial.json")
     # 2. Predict Physics
     
@@ -44,7 +49,8 @@ def main():
             print(f"Predicting physics for object {obj['id']}...")
             physics_props = predictor.predict(obj)
             if physics_props:
-                obj['physics'] = physics_props
+                obj['metadata'] = physics_props.get('metadata', {})
+                obj['usd_physics'] = physics_props.get('usd_physics', {})
             else:
                 print(f"Failed to predict physics for object {obj['id']}")
     else:
@@ -53,6 +59,30 @@ def main():
     # graph_gen.build_hierarchy(skip_frames=args.skip_frames)
     print("Skipping hierarchy building (Flat Graph)...")
     graph_gen.save_graph("scene_graph_final.json")
+
+    # 3. Generative Fill (Optional)
+    if args.fill_backsides:
+        print("\n--- Starting Generative Fill ---")
+        import subprocess
+        
+        # Construct PLY path assuming standard LangSplat structure
+        ply_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iteration}", "point_cloud.ply")
+        graph_path = os.path.join(args.output_dir, "scene_graph_final.json")
+        
+        cmd = [
+            sys.executable, "SplatGraph/fill_backsides.py",
+            "--graph_path", graph_path,
+            "--ply_path", ply_path,
+            "--model_path", args.model_path,
+            "--iteration", str(args.iteration)
+        ]
+        
+        print(f"Running command: {' '.join(cmd)}")
+        try:
+            subprocess.check_call(cmd)
+            print("Generative Fill completed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"Error running Generative Fill: {e}")
 
 if __name__ == "__main__":
     main()

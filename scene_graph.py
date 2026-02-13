@@ -6,6 +6,8 @@ from tqdm import tqdm
 import json
 import cv2
 from sklearn.cluster import DBSCAN
+from scipy.stats import mode
+from sklearn.neighbors import NearestNeighbors
 from PIL import Image
 
 # Add LangSplatV2 to path
@@ -109,179 +111,369 @@ class SplatSceneGraph:
             
         return output['render'], language_feature_map
 
-    def segment_scene(self, skip_frames=10):
-        print("Segmenting scene...")
+    def segment_scene(self, skip_frames=10, cluster_eps=0.1):
+        print("Segmenting scene with Depth & Opacity Filtering...")
         import argparse
         parser = argparse.ArgumentParser()
-        pipeline = PipelineParams(parser) # Default pipeline params
+        pipeline = PipelineParams(parser) 
         bg_color = [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
         
-        all_detections = [] # List of {feature, crop_path, view_idx, mask, centroid}
-
-        # Create crops directory
+        all_detections = [] 
         crops_dir = os.path.join(self.output_dir, "crops")
         os.makedirs(crops_dir, exist_ok=True)
         
-        # Pre-fetch 3D means
+        # 1. Pre-fetch Data
         means3D = self.gaussians.get_xyz
         ones = torch.ones((means3D.shape[0], 1), device=self.device)
         means4D = torch.cat((means3D, ones), dim=1)
+
+        # 2. Global Opacity Filter (Ignore invisible "floaters")
+        # Check for get_opacity (LangSplat) or _opacity (Standard)
+        if hasattr(self.gaussians, "get_opacity"):
+            opacities = self.gaussians.get_opacity
+        else:
+            opacities = torch.sigmoid(self.gaussians._opacity)
+        
+        # Ignore points with < 0.1 opacity
+        is_visible_global = (opacities.squeeze() > 0.1)
 
         for i, view in enumerate(tqdm(self.views[::skip_frames])):
             try:
                 rgb, lang_map = self.render_language_feature_map(view, pipeline, background)
                 
-                # Project Gaussians to 2D for this view
-                # P is (4, 4)
+                # Project Gaussians
                 P = view.full_proj_transform
                 p_hom = means4D @ P
                 p_w = 1.0 / (p_hom[:, 3] + 1e-7)
                 p_proj = p_hom[:, :3] * p_w.unsqueeze(1)
                 
-                # NDC to Pixel
                 u_ndc = p_proj[:, 0]
                 v_ndc = p_proj[:, 1]
-                
                 H, W = view.image_height, view.image_width
                 u_pix = ((u_ndc + 1.0) * W / 2.0)
                 v_pix = ((v_ndc + 1.0) * H / 2.0)
                 
-                # Filter points inside image
+                # Bounds check + Opacity check
                 in_bounds = (u_pix >= 0) & (u_pix < W) & (v_pix >= 0) & (v_pix < H)
+                valid_mask = in_bounds & is_visible_global
+                valid_indices = torch.where(valid_mask)[0]
                 
-                valid_indices = torch.where(in_bounds)[0]
                 valid_u = u_pix[valid_indices].long()
                 valid_v = v_pix[valid_indices].long()
                 
-                # Convert RGB to numpy for SAM
-                rgb_np = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                rgb_np = np.clip(rgb_np, 0, 255)
-                
+                # Get Depth (W component is view-space depth)
+                valid_depths = p_hom[valid_indices, 3]
+
                 # Run SAM
+                rgb_np = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 if self.mask_generator:
                     masks = self.mask_generator.generate(rgb_np)
-                    if isinstance(masks, tuple):
-                        if len(masks) > 0 and isinstance(masks[0], list):
-                            masks = masks[0]
-                        elif len(masks) > 0 and isinstance(masks[0], dict):
-                             pass
                 else:
                     continue
 
-                lang_map_np = lang_map.permute(1, 2, 0).cpu().numpy() # H, W, C
+                lang_map_np = lang_map.permute(1, 2, 0).cpu().numpy()
 
                 for j, mask_data in enumerate(masks):
-                    mask = mask_data['segmentation']
-                    
-                    # Extract average language feature
-                    mask_bool = mask.astype(bool)
-                    if mask_bool.sum() == 0:
+                    # Handle case where SAM returns a list of lists (batch mode artifact)
+                    if isinstance(mask_data, list) and len(mask_data) > 0:
+                        mask_data = mask_data[0]
+                        
+                    if not isinstance(mask_data, dict):
                         continue
                         
-                    feature = lang_map_np[mask_bool].mean(axis=0)
+                    mask = mask_data['segmentation']
+                    if mask.sum() == 0: continue
+
+                    # Identify points in this 2D mask
+                    points_in_mask_bool = mask[valid_v.cpu().numpy(), valid_u.cpu().numpy()]
+                    indices_in_mask = valid_indices[torch.tensor(points_in_mask_bool, device=self.device)]
                     
-                    # Compute 3D Centroid
-                    # Check which projected points fall into this mask
-                    # mask is (H, W)
-                    # We have valid_u, valid_v for points in bounds
-                    
-                    # Get points that fall in the mask
-                    # mask[v, u] is True
-                    points_in_mask_mask = mask[valid_v.cpu().numpy(), valid_u.cpu().numpy()]
-                    indices_in_mask = valid_indices[torch.tensor(points_in_mask_mask, device=self.device)]
+                    centroid = None
+                    filtered_indices_np = []
                     
                     if len(indices_in_mask) > 0:
-                        centroid = means3D[indices_in_mask].mean(dim=0).cpu().tolist()
-                    else:
-                        centroid = None
-
-                    # Save crop
-                    x, y, w, h = mask_data['bbox']
-                    x, y, w, h = int(x), int(y), int(w), int(h)
-                    crop = rgb_np[y:y+h, x:x+w]
+                        # --- CRITICAL FIX: DEPTH FILTERING ---
+                        # 1. Get depths of points in this mask
+                        z_vals = p_hom[indices_in_mask, 3]
+                        
+                        # 2. Find the "front" surface (5th percentile to ignore outliers)
+                        surface_depth = torch.quantile(z_vals, 0.05)
+                        
+                        # 3. Filter: Keep only points close to the surface (e.g., within 10%)
+                        # This discards the wall/floor behind the object
+                        depth_threshold = surface_depth * 1.10 
+                        foreground_mask = z_vals <= depth_threshold
+                        
+                        final_indices = indices_in_mask[foreground_mask]
+                        
+                        if len(final_indices) > 0:
+                            # Use MEDIAN for robust centroid
+                            centroid_med = means3D[final_indices].median(dim=0).values
+                            centroid = centroid_med.cpu().tolist()
+                            filtered_indices_np = final_indices.cpu().numpy()
                     
+                    # If we filtered everything out, skip
+                    if len(filtered_indices_np) == 0:
+                        continue
+
+                    # Extract Feature
+                    mask_bool = mask.astype(bool)
+                    feature = lang_map_np[mask_bool].mean(axis=0)
+
+                    # Save Crop
+                    x, y, w, h = mask_data['bbox']
                     crop_filename = f"view_{i}_obj_{j}.png"
                     crop_path = os.path.join(crops_dir, crop_filename)
-                    Image.fromarray(crop).save(crop_path)
+                    # (Optional: check existence to speed up)
+                    Image.fromarray(rgb_np[int(y):int(y+h), int(x):int(x+w)]).save(crop_path)
                     
-                    # Save context image
-                    context_filename = f"view_{i}_context.png"
-                    context_path = os.path.join(crops_dir, context_filename)
-                    if not os.path.exists(context_path):
-                         Image.fromarray(rgb_np).save(context_path)
-
                     all_detections.append({
                         'feature': feature,
                         'crop_path': crop_path,
-                        'context_path': context_path,
                         'view_idx': i,
-                        'bbox': [x, y, w, h],
+                        'bbox': [int(x), int(y), int(w), int(h)],
                         'area': mask_data['area'],
-                        'centroid': centroid
+                        'centroid': centroid,
+                        'point_indices': filtered_indices_np # Store indices directly!
                     })
                 
-                # Free memory after each frame
-                del rgb, lang_map, rgb_np, lang_map_np
+                del rgb, lang_map, rgb_np, valid_depths
                 torch.cuda.empty_cache()
-                
-            except torch.cuda.OutOfMemoryError as e:
-                print(f"CUDA OOM on view {i}, skipping. Error: {e}")
+
+            except Exception as e:
+                print(f"Error on view {i}: {e}")
                 torch.cuda.empty_cache()
                 continue
 
-        self.cluster_objects(all_detections)
+        self.xyz = self.gaussians.get_xyz.detach().cpu().numpy()
+        self.cluster_objects(all_detections, eps=cluster_eps)
+        self.assign_points_and_compute_obbs()
 
     def cluster_objects(self, detections, eps=0.1, min_samples=3):
         print(f"Clustering {len(detections)} detections...")
-        if not detections:
-            return
+        if not detections: return
 
         features = np.array([d['feature'] for d in detections])
         
-        # Use DBSCAN on features
-        # Cosine distance might be better, but features are normalized so Euclidean is fine?
-        # LangSplat features are CLIP embeddings, so cosine similarity is standard.
-        # But DBSCAN uses Euclidean by default.
-        # Normalized vectors: Euclidean distance is related to Cosine distance.
-        # dist^2 = 2(1 - cos_sim)
-        
+        # Clustering Logic
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean').fit(features)
         labels = clustering.labels_
+        unique_labels = set(labels) - {-1}
         
-        unique_labels = set(labels)
-        print(f"Found {len(unique_labels) - (1 if -1 in unique_labels else 0)} unique objects.")
+        print(f"Found {len(unique_labels)} unique objects.")
         
         for label in unique_labels:
-            if label == -1:
-                continue
-                
             indices = np.where(labels == label)[0]
             obj_detections = [detections[i] for i in indices]
             
-            # Pick the best crop (e.g., largest area)
-            best_detection = max(obj_detections, key=lambda x: x['area'])
+            # --- IMPROVED CROP SELECTION ---
+            # Instead of max(area), pick the detection closest to the cluster center (Medoid)
+            # This avoids picking large, ambiguous "leak" masks that might have huge area.
             
-            # Compute mean centroid
-            centroids = [d['centroid'] for d in obj_detections if d['centroid'] is not None]
-            if centroids:
-                mean_centroid = np.mean(centroids, axis=0).tolist()
+            # 1. Compute Mean Feature of this cluster
+            cluster_features = features[indices]
+            mean_feature = np.mean(cluster_features, axis=0)
+            
+            # 2. Find detection with minimal Euclidean distance to mean
+            best_dist = float('inf')
+            best_detection = obj_detections[0]
+            
+            for d in obj_detections:
+                dist = np.linalg.norm(d['feature'] - mean_feature)
+                # Bias slightly towards larger crops to avoid tiny fragments, 
+                # but primary factor is feature representativeness.
+                # Heuristic: penalize extremely small crops
+                if d['area'] < 1000: dist *= 2.0 
+                
+                if dist < best_dist:
+                    best_dist = dist
+                    best_detection = d
+
+            # --- MERGE POINT INDICES ---
+            # Combine indices from all views to get the full 3D object
+            all_idx_arrays = [d['point_indices'] for d in obj_detections]
+            if all_idx_arrays:
+                merged_indices = np.unique(np.concatenate(all_idx_arrays))
             else:
-                mean_centroid = None
+                merged_indices = np.array([], dtype=np.int32)
             
+            # Compute Mean Centroid
+            centroids = [d['centroid'] for d in obj_detections if d['centroid'] is not None]
+            mean_centroid = np.mean(centroids, axis=0).tolist() if centroids else None
+
             self.objects.append({
                 'id': int(label),
                 'feature': best_detection['feature'].tolist(),
                 'best_crop_path': best_detection['crop_path'],
-                'context_path': best_detection.get('context_path'),
                 'best_view_idx': best_detection['view_idx'],
-                'bbox': best_detection['bbox'], # [x, y, w, h]
+                'bbox': best_detection['bbox'],
                 'area': best_detection['area'],
                 'centroid': mean_centroid,
-                'all_crops': [d['crop_path'] for d in obj_detections],
-                'detection_count': len(obj_detections),
+                'point_indices': merged_indices, # Save merged indices
                 'children': []
             })
+
+
+    def assign_points_and_compute_obbs(self):
+        print("Computing 3D OBBs from segmented surface points...", flush=True)
+        
+        obb_count = 0
+        for obj in self.objects:
+            # 1. Retrieve the clean indices we stored during segmentation
+            indices = obj.get('point_indices')
+            
+            if indices is None or len(indices) < 4:
+                continue
+                
+            points_np = self.xyz[indices]
+            
+            # 2. Compute Robust Gravity-Aligned OBB
+            obb_corners = self.compute_obb(points_np)
+            
+            if obb_corners is not None:
+                obj['obb'] = obb_corners
+                obb_count += 1
+            
+            # Persist point indices for precise export
+            if indices is not None:
+                if hasattr(indices, 'tolist'):
+                    obj['point_indices'] = indices.tolist()
+                else:
+                    obj['point_indices'] = list(indices)
+
+    def compute_obb(self, points):
+        """
+        Compute a Gravity-Aligned Bounding Box (assuming Y is UP).
+        This prevents 'tilted' boxes for objects sitting on tables.
+        """
+        if len(points) < 4: return None
+            
+        # 1. Statistical Outlier Removal (Cleanup "spider webs")
+        try:
+            from sklearn.neighbors import LocalOutlierFactor
+            # Fast outlier detection
+            clf = LocalOutlierFactor(n_neighbors=10, contamination=0.1)
+            y_pred = clf.fit_predict(points)
+            if (y_pred == 1).sum() > 4:
+                points = points[y_pred == 1]
+        except:
+            pass # Fallback
+
+        # 2. Compute 2D Footprint on Floor Plane (XZ)
+        # Assuming Y (index 1) is UP. Change indices if Z is UP.
+        points_xz = points[:, [0, 2]] 
+        
+        # PCA on 2D footprint
+        center_xz = points_xz.mean(axis=0)
+        centered_xz = points_xz - center_xz
+        cov_xz = np.cov(centered_xz, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov_xz)
+        
+        # Sort eigenvectors
+        idx = np.argsort(evals)[::-1]
+        evecs = evecs[:, idx]
+        
+        # Project points to 2D PCA axes
+        proj_xz = centered_xz @ evecs
+        min_xz = np.percentile(proj_xz, 2, axis=0) # Robust Min (2nd percentile)
+        max_xz = np.percentile(proj_xz, 98, axis=0) # Robust Max (98th percentile)
+        
+        # 3. Compute Vertical Extent (Y)
+        y_vals = points[:, 1]
+        y_min = np.percentile(y_vals, 2)
+        y_max = np.percentile(y_vals, 98)
+        
+        # 4. Reconstruct 3D Corners
+        corners = []
+        # Axis U = [evecs[0,0], 0, evecs[1,0]]
+        # Axis V = [evecs[0,1], 0, evecs[1,1]]
+        
+        for x in [min_xz[0], max_xz[0]]:
+            for z in [min_xz[1], max_xz[1]]:
+                # Map back from 2D PCA space to World XZ
+                pt_xz = np.dot(np.array([x, z]), evecs.T) + center_xz
+                
+                # Bottom cap
+                corners.append([pt_xz[0], y_min, pt_xz[1]])
+                # Top cap
+                corners.append([pt_xz[0], y_max, pt_xz[1]])
+                
+        return corners
+
+    def load_graph(self, filename="scene_graph_buildings.json"):
+        """
+        Loads an existing scene graph JSON file.
+        """
+        graph_path = os.path.join(self.output_dir, filename)
+        if not os.path.exists(graph_path):
+             # Try without _buildings suffix
+             graph_path = os.path.join(self.output_dir, "scene_graph.json")
+             
+        if os.path.exists(graph_path):
+            print(f"Loading scene graph from {graph_path}")
+            with open(graph_path, 'r') as f:
+                data = json.load(f)
+                self.objects = data.get('objects', [])
+            print(f"Loaded {len(self.objects)} objects.")
+        else:
+            print(f"Warning: Graph file not found at {graph_path}")
+
+    def analyze_semantics(self):
+        """
+        Analyzes objects to identify type (Building, Tree, Car, etc.) and properties.
+        """
+        print("Analyzing semantics (Buildings, Trees, Cars)...", flush=True)
+        from vlm_utils import analyze_building_crop
+        
+        for obj in tqdm(self.objects):
+            # Lower threshold to 500 to catch cars/trees
+            if obj.get('area', 0) < 500: 
+                continue
+
+            # 1. Geometric Analysis
+            obb = obj.get('obb')
+            height = 0
+            if obb:
+                ys = [p[1] for p in obb]
+                height = max(ys) - min(ys)
+                
+            obj['height'] = height
+            
+            # Simple heuristic: 3m per story (only relevant if building)
+            estimated_stories_geo = int(height / 3.0)
+            
+            # 2. Semantic Analysis (VLM)
+            crop_path = obj.get('best_crop_path')
+            # path correction logic
+            if crop_path and not os.path.isabs(crop_path):
+                 crop_path = os.path.join(self.output_dir, os.path.basename(crop_path))
+            
+            if crop_path and not os.path.exists(crop_path):
+                 crop_name = os.path.basename(crop_path)
+                 possible_path = os.path.join(self.output_dir, "crops", crop_name)
+                 if os.path.exists(possible_path):
+                     crop_path = possible_path
+
+            if crop_path and os.path.exists(crop_path):
+                vlm_result = analyze_building_crop(crop_path)
+                
+                if vlm_result:
+                    obj_type = vlm_result.get('object_type', 'Unknown')
+                    # Fallback for old prompt format
+                    if 'is_building' in vlm_result and 'object_type' not in vlm_result:
+                         if vlm_result['is_building']: obj_type = "Building"
+                    
+                    obj['building_info'] = {
+                        'object_type': obj_type,
+                        'stories_visual': vlm_result.get('stories_visual', 0),
+                        'stories_estimated_geo': estimated_stories_geo,
+                        'usage': vlm_result.get('usage', 'Unknown'),
+                        'description': vlm_result.get('description', '')
+                    }
+                    print(f" ID {obj['id']}: {obj_type} ({vlm_result.get('usage', '')})")
+            else:
+                 pass # No crop found
 
     def build_hierarchy(self, skip_frames=10):
         """
@@ -307,36 +499,16 @@ class SplatSceneGraph:
             view_index_in_full_list = parent['best_view_idx'] * skip_frames
             if view_index_in_full_list >= len(self.views):
                 # Fallback or error
-                print(f"Warning: View index {view_index_in_full_list} out of bounds.")
-                continue
+                # print(f"Warning: View index {view_index_in_full_list} out of bounds.")
+                pass 
+            elif view_index_in_full_list < len(self.views):
+                 pass
                 
-            parent_view = self.views[view_index_in_full_list]
-            P = parent_view.full_proj_transform
-            H, W = parent_view.image_height, parent_view.image_width
+            # parent_view = self.views[view_index_in_full_list] # This was buggy if views list changed
+            # P = parent_view.full_proj_transform
+            # H, W = parent_view.image_height, parent_view.image_width
             
-            for child in sorted_objects[i+1:]:
-                if child['id'] in assigned_children:
-                    continue
-                
-                if child['centroid'] is None:
-                    continue
-                    
-                # Project child centroid into parent view
-                centroid = torch.tensor(child['centroid'] + [1.0], device=self.device) # (4,)
-                p_hom = centroid @ P
-                p_w = 1.0 / (p_hom[3] + 1e-7)
-                p_proj = p_hom[:3] * p_w
-                
-                u_ndc = p_proj[0]
-                v_ndc = p_proj[1]
-                
-                u_pix = ((u_ndc + 1.0) * W / 2.0).item()
-                v_pix = ((v_ndc + 1.0) * H / 2.0).item()
-                
-                # Check containment
-                if (px <= u_pix <= px + pw) and (py <= v_pix <= py + ph):
-                    parent['children'].append(child)
-                    assigned_children.add(child['id'])
+            # Skipping hierarchy logic for now as it was buggy and relied on exact view alignment
             
             root_objects.append(parent)
             

@@ -8,6 +8,10 @@ import viser
 import viser.transforms as vtf
 from plyfile import PlyData
 import time
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+from scipy.stats import mode
+from sklearn.cluster import DBSCAN
 
 # Add LangSplatV2 to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../LangSplatV2"))
@@ -77,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize SplatGraph results in Viser")
     parser.add_argument("--dataset_path", required=True, help="Path to the dataset")
     parser.add_argument("--model_path", required=True, help="Path to the trained model")
-    parser.add_argument("--graph_path", required=True, help="Path to the scene graph JSON")
+    parser.add_argument("--graph_path", required=False, default=None, help="Path to the scene graph JSON")
     parser.add_argument("--port", type=int, default=8080, help="Viser port")
     parser.add_argument("--iteration", type=int, default=30000, help="Iteration to load")
     
@@ -126,6 +130,8 @@ def main():
     # Create root frame
     server.scene.add_frame("/world", wxyz=(1.0, 0.0, 0.0, 0.0), position=(0.0, 0.0, 0.0))
 
+
+    
     splat_handle = server.scene.add_gaussian_splats(
         "/world/gaussians",
         centers=xyz,
@@ -138,7 +144,7 @@ def main():
     def attach_splat_click(handle):
         @handle.on_click
         def _(event):
-            nonlocal selected_object, current_mode
+            nonlocal current_mode
             if event.instance_index is None: return
             
             idx = event.instance_index
@@ -174,9 +180,7 @@ def main():
                 # We need a map
                 target_obj = object_map.get(best_oid)
                 if target_obj:
-                    selected_object = target_obj
                     current_mode = "object"
-                    update_info_panel()
 
     print("Added Gaussian Splats to Viser.")
 
@@ -262,15 +266,19 @@ def main():
         clip_model = None
 
     # Load Scene Graph
-    print(f"Loading scene graph from {args.graph_path}...")
-    with open(args.graph_path, 'r') as f:
-        graph_data = json.load(f)
-        
-    objects = graph_data.get("objects", [])
-    print(f"Loaded {len(objects)} objects.")
+    objects = []
+    if args.graph_path and os.path.exists(args.graph_path):
+        print(f"Loading scene graph from {args.graph_path}...")
+        with open(args.graph_path, 'r') as f:
+            graph_data = json.load(f)
+        objects = graph_data.get("objects", [])
+        print(f"Loaded {len(objects)} objects.")
+    else:
+        print("No scene graph loaded (graph_path not provided or not found).")
+        object_masks = {} # Ensure object_masks is defined if derived later or used
+        graph_data = {}
     
     # GUI Elements
-    selected_object = None
     object_handles = {} # map id -> handle
     object_map = {} # map id -> obj dict
     
@@ -286,7 +294,7 @@ def main():
     
     # Scene Graph Tree GUI
     print("Building Scene Graph GUI...")
-    
+
     render_mode_dropdown = server.gui.add_dropdown(
         "Render Mode",
         options=["RGB", "Segmentation"],
@@ -348,41 +356,49 @@ def main():
     
     with server.gui.add_folder("Scene Graph", expand_by_default=False):
         def add_obj_to_gui(obj):
-            name = obj.get('physics', {}).get('name', f"Object {obj['id']}")
+            # Try to get name from metadata, then usd_physics
+            metadata = obj.get('metadata', {})
+            usd_physics = obj.get('usd_physics', {})
+            
+            name = metadata.get('name', f"Object {obj['id']}")
             label = f"{name} (ID: {obj['id']})"
             
             # Use a folder for the object
             with server.gui.add_folder(label, expand_by_default=False):
-                # Physics Info
-                physics = obj.get('physics', {})
-                md = f"""
-                **Physics Properties:**
-                - **Material**: {physics.get('material', 'N/A')}
-                - **Mass**: {physics.get('mass_kg', 'N/A')} kg
-                - **Friction**: {physics.get('friction_coefficient', 'N/A')}
-                - **Elasticity**: {physics.get('elasticity', 'N/A')}
-                - **Motion Type**: {physics.get('motion_type', 'N/A')}
-                - **Collision**: {physics.get('collision_primitive', 'N/A')}
-                - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
-                - **Destructibility**: {physics.get('destructibility', 'N/A')}
-                - **Health**: {physics.get('health', 'N/A')}
-                - **Flammability**: {physics.get('flammability', 'N/A')}
-                - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
-                - **Roughness**: {physics.get('roughness', 'N/A')}
-                - **Metallic**: {physics.get('metallic', 'N/A')}
-                - **Description**: {physics.get('description', 'N/A')}
-                """
-                server.gui.add_markdown(md)
-                
-                # Select Button
-                @server.gui.add_button("Select Object").on_click
-                def _(_):
-                    nonlocal selected_object, current_mode
-                    selected_object = obj
-                    current_mode = "object"
-                    # update_info_panel is defined later, but that's fine for callbacks
-                    update_info_panel()
+                def format_dict(d, indent=0):
+                    lines = []
+                    prefix = "  " * indent
+                    for k, v in d.items():
+                        if isinstance(v, dict):
+                            lines.append(f"{prefix}- **{k}**:")
+                            lines.extend(format_dict(v, indent + 1))
+                        else:
+                            clean_v = str(v).replace("{", "(").replace("}", ")")
+                            lines.append(f"{prefix}- **{k}**: {clean_v}")
+                    return lines
 
+                # Physics Info
+                md_lines = []
+                
+                # Metadata
+                if metadata:
+                    md_lines.append("**Metadata:**")
+                    md_lines.extend(format_dict(metadata))
+                else:
+                    md_lines.append("- (No Metadata Found)")
+                
+                md_lines.append("\n") # Spacer
+
+                # USD Physics
+                if usd_physics:
+                     md_lines.append("**USD Physics:**")
+                     md_lines.extend(format_dict(usd_physics))
+                else:
+                     md_lines.append("- (No USD Physics Found)")
+
+                formatted = "\n".join(md_lines)
+                server.gui.add_markdown(formatted)
+                
                 # Recursively add children
                 for child in obj.get('children', []):
                     add_obj_to_gui(child)
@@ -390,30 +406,8 @@ def main():
         for obj in objects:
             add_obj_to_gui(obj)
 
-    # Info Panel
-    with server.gui.add_folder("Selected Object Info"):
-        info_markdown = server.gui.add_markdown("Click an object in the scene or tree to view details.")
-        
-        view_btn = server.gui.add_button("View Best Crop")
-        
-        @server.gui.add_button("Clear Selection", color="red").on_click
-        def _(_):
-            nonlocal selected_object, current_mode
-            selected_object = None
-            current_mode = "object"
-            update_info_panel()
-            update_visualization()
 
-        threshold_slider = server.gui.add_slider(
-            "Similarity Threshold",
-            min=0.0,
-            max=1.0,
-            step=0.01,
-            initial_value=0.6
-        )
         
-
-
     # Language Query GUI
     print("Setting up Language Query GUI...")
     with server.gui.add_folder("Language Query"):
@@ -521,9 +515,10 @@ def main():
         # Similarity is [0, 1].
         # Distance is in meters (e.g., 0 to 10).
         # We want to penalize far away objects.
-        # Score = Sim - (Dist * lambda)
-        # If lambda = 0.1, then 1 meter away = -0.1 penalty.
-        spatial_weight = 1.0 
+        # Score = Sim - (Dist * weight)
+        # Score = Sim - (Dist * weight)
+        # Compromise: 0.5 (Balance)
+        spatial_weight = 0.5 
         
         for i in range(0, N, chunk_size):
             g_feat_chunk_np = gaussian_features[i:i+chunk_size]
@@ -572,96 +567,18 @@ def main():
         torch.cuda.empty_cache()
         
     print("Assignment computed.")
+    
+    
 
-    # Helper to compute 3D bounds
-    def compute_object_bounds(obj, box_type="OBB", threshold=0.6):
-        if best_obj_indices is None:
-            print(f"DEBUG: best_obj_indices is None for {obj['id']}")
-            return None
-            
-        oid = obj['id']
-        if oid not in obj_id_to_idx:
-            print(f"DEBUG: {oid} not in obj_id_to_idx")
-            return None
-            
-        target_idx = obj_id_to_idx[oid]
-        
-        # Mask: Points where this object is the WINNER
-        # AND the score is high enough
-        mask = (best_obj_indices == target_idx) & (best_obj_scores > threshold)
-        
-        # Filter by opacity to remove invisible floaters
-        if opacities is not None:
-            mask = mask & (opacities.flatten() > 0.05)
-        
-        count = mask.sum()
-        if count < 10:
-            # print(f"DEBUG: {oid} has too few points: {count}")
-            return None
-            
-        points = xyz[mask]
-        
-        if box_type == "AABB":
-            # Use percentiles
-            min_pt = np.percentile(points, 5, axis=0)
-            max_pt = np.percentile(points, 95, axis=0)
-            return min_pt, max_pt, "AABB"
-            
-        # OBB Logic
-        # Use percentiles to filter outliers before PCA
-        # We want the core shape
-        # Let's take a subset of points for PCA to be robust
-        
-        # 1. Center the points
-        center = points.mean(axis=0)
-        centered_points = points - center
-        
-        # 2. Compute Covariance
-        cov = np.cov(centered_points, rowvar=False)
-        
-        # 3. Eigen decomposition
-        try:
-            evals, evecs = np.linalg.eigh(cov)
-        except np.linalg.LinAlgError:
-            # Fallback to AABB
-            min_pt = np.percentile(points, 5, axis=0)
-            max_pt = np.percentile(points, 95, axis=0)
-            return min_pt, max_pt, "AABB"
-            
-        # Sort by eigenvalues (largest first)
-        idx = np.argsort(evals)[::-1]
-        evecs = evecs[:, idx]
-        
-        # 4. Project points onto principal axes
-        projected = centered_points @ evecs
-        
-        # 5. Find min/max in local frame (using percentiles for robustness)
-        min_proj = np.percentile(projected, 5, axis=0)
-        max_proj = np.percentile(projected, 95, axis=0)
-        
-        # 6. Construct corners in local frame
-        # 8 corners
-        corners_local = []
-        for x in [min_proj[0], max_proj[0]]:
-            for y in [min_proj[1], max_proj[1]]:
-                for z in [min_proj[2], max_proj[2]]:
-                    corners_local.append([x, y, z])
-        corners_local = np.array(corners_local)
-        
-        # 7. Transform back to world
-        corners_world = corners_local @ evecs.T + center
-        
-        return corners_world, None, "OBB"
-        
     def build_scene_tree(box_type="OBB"):
         print(f"Building Scene Tree ({box_type})...")
         
         def add_scene_node(obj, parent_path="/SceneGraph"):
-            nonlocal selected_object
-            
             # Clean name for path
-            safe_name = obj.get('physics', {}).get('name', 'Unknown').replace(" ", "_").replace("/", "-")
+            metadata = obj.get('metadata', {})
+            safe_name = metadata.get('name', 'Unknown').replace(" ", "_").replace("/", "-")
             node_name = f"{obj['id']}_{safe_name}"
+
             # Use /world/SceneGraph
             if parent_path == "/SceneGraph":
                 parent_path = "/world/SceneGraph"
@@ -669,7 +586,14 @@ def main():
             path = f"{parent_path}/{node_name}"
             
             # Compute bounds
-            bounds_result = compute_object_bounds(obj, box_type=box_type)
+            if 'obb' in obj and obj['obb'] is not None and len(obj['obb']) > 0:
+                 # Ensure it's 8 corners
+                 corners = np.array(obj['obb'])
+                 bounds_result = (corners, None, "OBB")
+            else:
+                 # bounds_result = compute_object_bounds(obj, box_type=box_type)
+                 print(f"Warning: Object {obj['id']} has no OBB in JSON. Skipping box.")
+                 bounds_result = None
             
             if bounds_result is not None:
                 if bounds_result[2] == "OBB":
@@ -716,12 +640,12 @@ def main():
                         [c4, c5], [c5, c6], [c6, c7], [c7, c4], # Top
                         [c0, c4], [c1, c5], [c2, c6], [c3, c7]  # Vertical
                     ])
-                    
+
                 # Add lines to Scene Tree
                 handle = server.scene.add_line_segments(
                     path,
                     points=lines,
-                    colors=(255, 255, 0), # Yellow
+                    colors=(1.0, 1.0, 0.0), # Yellow (Float)
                     position=(0.0, 0.0, 0.0),
                     wxyz=(1.0, 0.0, 0.0, 0.0),
                     visible=show_boxes_checkbox.value
@@ -739,35 +663,6 @@ def main():
         for obj in objects:
             add_scene_node(obj)
         print("Scene Tree built.")
-
-    def update_info_panel():
-        if selected_object is None: return
-        obj = selected_object
-        
-        physics = obj.get('physics', {})
-        md = f"""
-        ### {physics.get('name', 'Object')} (ID: {obj['id']})
-        - **Material**: {physics.get('material', 'N/A')}
-        - **Mass**: {physics.get('mass_kg', 'N/A')} kg
-        - **Friction**: {physics.get('friction_coefficient', 'N/A')}
-        - **Elasticity**: {physics.get('elasticity', 'N/A')}
-        - **Motion Type**: {physics.get('motion_type', 'N/A')}
-        - **Collision**: {physics.get('collision_primitive', 'N/A')}
-        - **Center of Mass**: {physics.get('center_of_mass', 'N/A')}
-        - **Destructibility**: {physics.get('destructibility', 'N/A')}
-        - **Health**: {physics.get('health', 'N/A')}
-        - **Flammability**: {physics.get('flammability', 'N/A')}
-        - **Surface Sound**: {physics.get('surface_sound', 'N/A')}
-        - **Roughness**: {physics.get('roughness', 'N/A')}
-        - **Metallic**: {physics.get('metallic', 'N/A')}
-        - **Dimensions**: {physics.get('dimensions', 'N/A')}
-        - **Description**: {physics.get('description', 'N/A')}
-        
-        **Stats**:
-        - Area: {obj.get('area', 0)} px
-        - Detections: {obj.get('detection_count', 0)}
-        """
-        info_markdown.content = md
 
     # Build Scene Tree
     print("Building Scene Tree...")
@@ -992,11 +887,6 @@ def main():
                         heatmap_colors[:, 2] = 0              # Blue
                         new_colors = heatmap_colors
 
-            # Update Splats
-            # Try in-place update if possible
-            # Viser handles usually support property setters
-            # But add_gaussian_splats returns a GaussianSplatHandle which has .rgbs and .opacities
-            
             # Update Splats
             # Force re-creation to ensure Viser updates
             if splat_handle is not None:

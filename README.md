@@ -75,15 +75,10 @@ The pipeline produces a `scene_graph_final.json` file containing the scene graph
   "objects": [
     {
       "id": 0,
-      "physics": {
+      "metadata": {
         "name": "wooden_crate",
         "material": "wood",
-        "mass_kg": 5.0,
-        "friction_coefficient": 0.6,
-        "elasticity": 0.2,
-        "motion_type": "dynamic",
-        "collision_primitive": "box",
-        "center_of_mass": "center",
+        "description": "A sturdy wooden crate used for storage.",
         "destructibility": "breakable",
         "health": 50,
         "flammability": 0.8,
@@ -95,7 +90,23 @@ The pipeline produces a `scene_graph_final.json` file containing the scene graph
             "width": 0.5,
             "height": 0.5
         },
-        "description": "A sturdy wooden crate used for storage."
+        "motion_type": "dynamic"
+      },
+      "usd_physics": {
+        "mass": {
+            "mass": 5.0,
+            "density": 1000.0,
+            "centerOfMass": [0.0, 0.0, 0.0]
+        },
+        "rigid_body": {
+            "rigidBodyEnabled": true,
+            "kinematicEnabled": false
+        },
+        "collision": {
+            "collisionEnabled": true,
+            "simulationOwner": "PhysicsScene",
+            "collisionApproximation": "convexHull"
+        }
       },
       "children": [],
       "best_crop_path": "...",
