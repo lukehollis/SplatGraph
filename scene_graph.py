@@ -80,6 +80,8 @@ class SplatSceneGraph:
             if self.gaussians._language_feature_codebooks is None:
                 raise ValueError(f"Checkpoint at {checkpoint_path} does not contain language features. "
                                  "Make sure you're using a LangSplatV2 trained model (e.g., from langsplat_output).")
+            # Pre-compute all per-Gaussian language features for downstream reassignment
+            self.gaussian_features = self._compute_gaussian_features()
         else:
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found!")
         self.views = self.scene.getTrainCameras()
@@ -89,9 +91,177 @@ class SplatSceneGraph:
         if os.path.exists(self.sam_checkpoint):
             sam = sam_model_registry["vit_h"](checkpoint=self.sam_checkpoint)
             sam.to(device=self.device)
-            self.mask_generator = SamAutomaticMaskGenerator(sam)
+            # Tune SAM for higher granularity (more objects)
+            self.mask_generator = SamAutomaticMaskGenerator(
+                sam,
+                points_per_side=32,
+                pred_iou_thresh=0.80,
+                stability_score_thresh=0.88
+            )
         else:
             print(f"Warning: SAM checkpoint not found at {self.sam_checkpoint}")
+
+    def _compute_gaussian_features(self):
+        """Compute per-Gaussian language feature vectors from the LangSplat codebooks."""
+        print("Computing per-Gaussian language features for global reassignment...")
+        logits = self.gaussians._language_feature_logits
+        codebooks = self.gaussians._language_feature_codebooks
+        L, K, D = codebooks.shape
+        logits = logits.to(self.device)
+        codebooks = codebooks.to(self.device)
+        weights_list = []
+        for i in range(L):
+            level_logits = logits[:, i * K:(i + 1) * K]
+            weights_list.append(torch.softmax(level_logits, dim=1))
+        weights = torch.cat(weights_list, dim=1)
+        codebooks_flat = codebooks.view(-1, D)
+        chunk_size = 50000
+        N = weights.shape[0]
+        features_list = []
+        with torch.no_grad():
+            for i in range(0, N, chunk_size):
+                chunk_w = weights[i:i + chunk_size]
+                chunk_f = chunk_w @ codebooks_flat
+                chunk_f = chunk_f / (chunk_f.norm(dim=1, keepdim=True) + 1e-10)
+                features_list.append(chunk_f.cpu())
+        features = torch.cat(features_list, dim=0)  # (N, D)
+        print(f"  -> Computed features for {N} Gaussians (dim={D}).")
+        return features
+
+    def reassign_points_by_feature(self, spatial_weight=1.5, threshold=0.3):
+        """
+        Feature-based reassignment within SAM-candidate Gaussians ONLY.
+
+        SAM already depth-filtered the foreground. This function only reassigns
+        points that were in at least one SAM mask — it does NOT sweep global
+        background Gaussians. This prevents color bleed into empty space.
+
+        Spatial normalization uses the MEDIAN inter-centroid distance (not max),
+        so a single far-outlier object can't dilute the penalty for nearby objects.
+        """
+        if not hasattr(self, 'gaussian_features') or self.gaussian_features is None:
+            print("Warning: gaussian_features not available, skipping reassignment.")
+            return
+        if not self.objects:
+            return
+
+        # --- 0. Remove extreme outlier objects before reassignment ---
+        # Objects whose centroid is far from the scene median are likely noise.
+        all_centroids = np.array([o['centroid'] if o['centroid'] is not None else [0.,0.,0.]
+                                  for o in self.objects])
+        scene_median = np.median(all_centroids, axis=0)
+        centroid_dists_from_median = np.linalg.norm(all_centroids - scene_median, axis=1)
+        scene_scale = np.median(centroid_dists_from_median)  # typical spread
+        outlier_threshold = max(scene_scale * 5.0, 5.0)       # clip at 5x median or 5m
+        valid_obj_mask = centroid_dists_from_median < outlier_threshold
+        if not valid_obj_mask.all():
+            n_outliers = (~valid_obj_mask).sum()
+            for k, obj in enumerate(self.objects):
+                if not valid_obj_mask[k]:
+                    print(f"  Removing outlier object '{obj.get('metadata', {}).get('name', k)}' "
+                          f"(centroid dist={centroid_dists_from_median[k]:.1f}m from scene)")
+                    obj['point_indices'] = []
+
+        # --- 1. Radial seed clip + build SAM candidate mask ---
+        # BEFORE building the candidate pool, clip each object's SAM seeds to the
+        # inner 70th percentile of distances from the object centroid.  This removes
+        # the long tail of grazing-angle / projection-noise Gaussians that leaked
+        # into the depth-filtered mask but are physically far from the object core.
+        N = self.gaussian_features.shape[0]
+        for k, obj in enumerate(self.objects):
+            if not valid_obj_mask[k]:
+                continue
+            pts_idx = np.asarray(obj.get('point_indices', []), dtype=np.int64)
+            if len(pts_idx) < 5:
+                continue
+            centroid_np = np.array(obj['centroid'] if obj['centroid'] is not None else [0.0]*3)
+            pts_3d = self.xyz[pts_idx]
+            dists = np.linalg.norm(pts_3d - centroid_np, axis=1)
+            clip_r = np.percentile(dists, 70)  # keep inner 70%
+            clip_r = max(clip_r, 0.05)          # never clip tighter than 5cm
+            keep_mask = dists <= clip_r
+            obj['point_indices'] = pts_idx[keep_mask].tolist()
+
+        candidate_mask = np.zeros(N, dtype=bool)
+        for k, obj in enumerate(self.objects):
+            if not valid_obj_mask[k]:
+                continue  # skip outliers
+            pts = obj.get('point_indices', [])
+            if len(pts):
+                candidate_mask[np.asarray(pts, dtype=np.int64)] = True
+        candidate_indices = np.where(candidate_mask)[0]
+        print(f"Reassigning {len(candidate_indices)} SAM-candidate Gaussians after radial clip "
+              f"(of {N} total; {N - len(candidate_indices)} background kept as-is)...")
+
+        valid_objects = [o for k, o in enumerate(self.objects) if valid_obj_mask[k]]
+        if not valid_objects:
+            return
+
+        obj_features = np.stack([np.array(o['feature']) for o in valid_objects])
+        obj_features = obj_features / (np.linalg.norm(obj_features, axis=1, keepdims=True) + 1e-10)
+        obj_centroids = np.array([o['centroid'] if o['centroid'] is not None else [0.0, 0.0, 0.0]
+                                  for o in valid_objects])
+
+        device = self.device
+        # Only load candidate subset onto GPU
+        g_feats_all = self.gaussian_features  # CPU tensor, full
+        g_feats_cand = g_feats_all[candidate_indices].float().to(device)
+        g_xyz_cand   = torch.from_numpy(self.xyz[candidate_indices]).float().to(device)
+        o_feats = torch.from_numpy(obj_features).float().to(device)
+        o_cents = torch.from_numpy(obj_centroids).float().to(device)
+
+        chunk = 50000
+        K = len(valid_objects)
+        cand_assignments_local = np.full(len(candidate_indices), -1, dtype=np.int32)  # local index
+        cand_best_sims   = np.zeros(len(candidate_indices), dtype=np.float32)
+
+        # --- KEY FIX: Normalize spatial penalty by MEDIAN inter-centroid distance ---
+        # The max would be dominated by any single outlier object far from the scene.
+        # Median gives a robust, scene-scale normalization that makes the spatial
+        # penalty meaningful for co-located objects.
+        centroid_dists_matrix = torch.cdist(o_cents, o_cents)  # (K, K)
+        if K > 1:
+            # Extract upper triangular (pairwise distances)
+            triu_mask = torch.triu(torch.ones(K, K, dtype=torch.bool), diagonal=1)
+            pairwise = centroid_dists_matrix[triu_mask]
+            median_centroid_dist = pairwise.median().clamp(min=0.05)
+        else:
+            median_centroid_dist = torch.tensor(1.0, device=device)
+        print(f"  Spatial normalization: median inter-centroid dist = {median_centroid_dist.item():.3f}m")
+
+        with torch.no_grad():
+            for i in range(0, len(candidate_indices), chunk):
+                gf = g_feats_cand[i:i + chunk]
+                gx = g_xyz_cand[i:i + chunk]
+                sim = gf @ o_feats.T                           # (B, K)
+                dist = torch.cdist(gx, o_cents)                # (B, K)
+                # Score = cosine similarity - spatial penalty
+                # Dividing by median dist means dist=1*median_dist gives penalty=spatial_weight
+                score = sim - (dist / median_centroid_dist) * spatial_weight
+                best_idx = score.argmax(dim=1)
+                best_sim = torch.gather(sim, 1, best_idx.unsqueeze(1)).squeeze(1)
+                cand_assignments_local[i:i + chunk] = best_idx.cpu().numpy()
+                cand_best_sims[i:i + chunk]   = best_sim.cpu().numpy()
+
+        # Apply similarity threshold — low-confidence SAM points become background
+        cand_assignments_local[cand_best_sims < threshold] = -1
+
+        # --- 2. Map local valid-object indices back to global object indices ---
+        valid_indices_global = [k for k, v in enumerate(valid_obj_mask) if v]
+        full_assignments = np.full(N, -1, dtype=np.int32)
+        for local_k, global_k in enumerate(valid_indices_global):
+            cand_sel = cand_assignments_local == local_k
+            full_assignments[candidate_indices[cand_sel]] = global_k
+
+        for k, obj in enumerate(self.objects):
+            new_indices = np.where(full_assignments == k)[0]
+            obj['point_indices'] = new_indices.tolist()
+
+        assigned = (full_assignments >= 0).sum()
+        print(f"Reassignment complete: {assigned} / {N} points assigned "
+              f"({N - assigned} background).")
+        del g_feats_cand, o_feats, g_xyz_cand, o_cents
+        torch.cuda.empty_cache()
 
     def render_language_feature_map(self, view, pipeline, background):
         # Adapted from eval_3d_ovs.py
@@ -130,7 +300,7 @@ class SplatSceneGraph:
             opacities = torch.sigmoid(self.gaussians._opacity)
         
         # Ignore points with < 0.1 opacity
-        is_visible_global = (opacities.squeeze() > 0.1)
+        is_visible_global = (opacities.squeeze() > 0.05) # Lowered from 0.1
 
         for i, view in enumerate(tqdm(self.views[::skip_frames])):
             try:
@@ -194,9 +364,10 @@ class SplatSceneGraph:
                         # 2. Find the "front" surface (5th percentile to ignore outliers)
                         surface_depth = torch.quantile(z_vals, 0.05)
                         
-                        # 3. Filter: Keep only points close to the surface (e.g., within 10%)
-                        # This discards the wall/floor behind the object
-                        depth_threshold = surface_depth * 1.10 
+                        # 3. Filter: Keep only points very close to the surface (within 1%).
+                        # 1.01x is much stricter than the old 1.05x — it suppresses
+                        # background splats that are physically behind the object.
+                        depth_threshold = surface_depth * 1.01
                         foreground_mask = z_vals <= depth_threshold
                         
                         final_indices = indices_in_mask[foreground_mask]
@@ -242,9 +413,166 @@ class SplatSceneGraph:
 
         self.xyz = self.gaussians.get_xyz.detach().cpu().numpy()
         self.cluster_objects(all_detections, eps=cluster_eps)
+        # Step 0.5: Merge objects whose centroids are nearly identical
+        # (same real-world object detected from multiple views)
+        self.merge_nearby_objects()
+        # Step 1: Reassign SAM-candidate Gaussians by feature similarity (tight, no bleed)
+        self.reassign_points_by_feature()
+        # Step 2: DBSCAN clean each object's point set
+        self.expand_objects_spatially()
+        # Step 3: Recompute OBBs using final point assignments
         self.assign_points_and_compute_obbs()
 
-    def cluster_objects(self, detections, eps=0.1, min_samples=3):
+    def merge_nearby_objects(self, radius: float = 0.25):
+        """
+        Merge objects whose 3D centroids are within `radius` metres of each other.
+
+        This handles the common case where the same physical object is detected
+        from multiple camera views and ends up as two separate clusters in feature
+        space because the rendered crop angle was slightly different.  After
+        merging we keep the highest-area detection's feature/crop as the
+        representative and union the point indices.
+        """
+        if len(self.objects) < 2:
+            return
+
+        centroids = np.array([o['centroid'] if o['centroid'] is not None else [0., 0., 0.]
+                              for o in self.objects])  # (K, 3)
+
+        # Union-Find to group close objects
+        parent = list(range(len(self.objects)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            parent[find(x)] = find(y)
+
+        K = len(self.objects)
+        for i in range(K):
+            for j in range(i + 1, K):
+                d = np.linalg.norm(centroids[i] - centroids[j])
+                if d < radius:
+                    union(i, j)
+
+        # Collect groups
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(K):
+            groups[find(i)].append(i)
+
+        n_merged = sum(1 for g in groups.values() if len(g) > 1)
+        if n_merged:
+            print(f"merge_nearby_objects: merging {n_merged} group(s) of co-located objects.")
+
+        merged_objects = []
+        for root, members in groups.items():
+            if len(members) == 1:
+                merged_objects.append(self.objects[members[0]])
+                continue
+
+            # Pick the highest-area member as the representative
+            rep = max(members, key=lambda i: self.objects[i].get('area', 0))
+            rep_obj = dict(self.objects[rep])  # shallow copy
+
+            # Union point indices
+            all_pts = []
+            for m in members:
+                pts = self.objects[m].get('point_indices', [])
+                if len(pts):
+                    all_pts.append(np.asarray(pts, dtype=np.int64))
+            if all_pts:
+                rep_obj['point_indices'] = np.unique(np.concatenate(all_pts)).tolist()
+
+            # Average centroid
+            cs = [self.objects[m]['centroid'] for m in members
+                  if self.objects[m].get('centroid') is not None]
+            rep_obj['centroid'] = np.mean(cs, axis=0).tolist() if cs else rep_obj.get('centroid')
+
+            merged_objects.append(rep_obj)
+            names = [self.objects[m].get('metadata', {}) for m in members]
+            print(f"  Merged objects {members} -> 1 object (area rep={rep})")
+
+        print(f"  Objects: {K} -> {len(merged_objects)} after merge.")
+        self.objects = merged_objects
+
+    def expand_objects_spatially(self):
+        """
+        DBSCAN-clean only (no spatial expansion).
+
+        For each object, run DBSCAN on the SAM-reassigned seed points to identify
+        the LARGEST spatially-coherent cluster. Discard all disconnected outlier
+        sub-clusters (these are typically background/floor Gaussians that leaked
+        through depth or projection noise in the SAM step).
+
+        The result is a clean, tight per-object point set suitable for accurate
+        OBB computation. No new Gaussians are added from outside the SAM seeds.
+        """
+        from sklearn.cluster import DBSCAN as _DBSCAN
+        from sklearn.neighbors import NearestNeighbors as _NN
+
+        N = len(self.xyz)
+        final_assignments = np.full(N, -1, dtype=np.int32)
+        # Seed from current tight SAM assignments
+        for k, obj in enumerate(self.objects):
+            for idx in obj.get('point_indices', []):
+                final_assignments[idx] = k
+
+        for k, obj in enumerate(self.objects):
+            pts_idx = np.array(obj.get('point_indices', []), dtype=np.int64)
+            if len(pts_idx) < 10:
+                continue  # too few to clean
+
+            pts = self.xyz[pts_idx]
+
+            # Auto-scale epsilon: use 85th pct of NN distances.
+            # The radial seed clip (70th pct from centroid) already enforces
+            # tightness; DBSCAN's sole job here is to drop disconnected
+            # floating sub-clusters — NOT to discard the bulk of good points.
+            try:
+                nn_dists, _ = _NN(n_neighbors=2).fit(pts).kneighbors(pts)
+                eps_auto = float(np.percentile(nn_dists[:, 1], 85))
+            except Exception:
+                eps_auto = 0.05
+            eps_auto = max(eps_auto, 0.02)
+
+            # min_samples=5: light core density requirement
+            dbs = _DBSCAN(eps=eps_auto, min_samples=5).fit(pts)
+            labels = dbs.labels_
+
+            unique_labels = [l for l in set(labels) if l >= 0]
+            if not unique_labels:
+                # No coherent cluster found – keep all (already assigned)
+                continue
+
+            # Keep LARGEST cluster only
+            largest = max(unique_labels, key=lambda l: (labels == l).sum())
+            inlier_mask = labels == largest
+            inlier_idx  = pts_idx[inlier_mask]
+            outlier_idx = pts_idx[~inlier_mask]
+
+            # Update assignments: outliers go back to background
+            final_assignments[outlier_idx] = -1
+            # (inliers already assigned to k)
+
+            cluster_size = inlier_mask.sum()
+            outlier_size = (~inlier_mask).sum()
+            if outlier_size > 0:
+                print(f"  Object {k} DBSCAN: kept {cluster_size} / {len(pts_idx)} pts "
+                      f"(removed {outlier_size} outliers, eps={eps_auto:.3f})")
+
+        # Write back
+        for k, obj in enumerate(self.objects):
+            obj['point_indices'] = np.where(final_assignments == k)[0].tolist()
+
+        assigned = (final_assignments >= 0).sum()
+        print(f"DBSCAN-clean complete: {assigned} / {N} Gaussians assigned "
+              f"({N - assigned} background).")
+
+    def cluster_objects(self, detections, eps=0.1, min_samples=2):
         print(f"Clustering {len(detections)} detections...")
         if not detections: return
 
@@ -339,60 +667,52 @@ class SplatSceneGraph:
     def compute_obb(self, points):
         """
         Compute a Gravity-Aligned Bounding Box (assuming Y is UP).
-        This prevents 'tilted' boxes for objects sitting on tables.
+        Uses centroid-distance percentile clipping to remove outlier splats.
         """
         if len(points) < 4: return None
-            
-        # 1. Statistical Outlier Removal (Cleanup "spider webs")
-        try:
-            from sklearn.neighbors import LocalOutlierFactor
-            # Fast outlier detection
-            clf = LocalOutlierFactor(n_neighbors=10, contamination=0.1)
-            y_pred = clf.fit_predict(points)
-            if (y_pred == 1).sum() > 4:
-                points = points[y_pred == 1]
-        except:
-            pass # Fallback
+
+        # 1. Centroid-distance percentile clipping (replaces LOF).
+        #    Removes the farthest 15% of points from the centroid — the "spider web"
+        #    floater splats that bloat bounding boxes. Much faster than LOF.
+        centroid = points.mean(axis=0)
+        dists = np.linalg.norm(points - centroid, axis=1)
+        dist_thresh = np.percentile(dists, 85)
+        points = points[dists <= dist_thresh]
+        if len(points) < 4:
+            return None
 
         # 2. Compute 2D Footprint on Floor Plane (XZ)
-        # Assuming Y (index 1) is UP. Change indices if Z is UP.
-        points_xz = points[:, [0, 2]] 
-        
+        # Assuming Y (index 1) is UP.
+        points_xz = points[:, [0, 2]]
+
         # PCA on 2D footprint
         center_xz = points_xz.mean(axis=0)
         centered_xz = points_xz - center_xz
         cov_xz = np.cov(centered_xz, rowvar=False)
         evals, evecs = np.linalg.eigh(cov_xz)
-        
-        # Sort eigenvectors
+
+        # Sort eigenvectors by descending variance
         idx = np.argsort(evals)[::-1]
         evecs = evecs[:, idx]
-        
+
         # Project points to 2D PCA axes
         proj_xz = centered_xz @ evecs
-        min_xz = np.percentile(proj_xz, 2, axis=0) # Robust Min (2nd percentile)
-        max_xz = np.percentile(proj_xz, 98, axis=0) # Robust Max (98th percentile)
-        
-        # 3. Compute Vertical Extent (Y)
+        min_xz = np.percentile(proj_xz, 2, axis=0)   # Robust Min
+        max_xz = np.percentile(proj_xz, 98, axis=0)  # Robust Max
+
+        # 3. Compute Vertical Extent (Y axis)
         y_vals = points[:, 1]
         y_min = np.percentile(y_vals, 2)
         y_max = np.percentile(y_vals, 98)
-        
-        # 4. Reconstruct 3D Corners
+
+        # 4. Reconstruct 8 3D corners
         corners = []
-        # Axis U = [evecs[0,0], 0, evecs[1,0]]
-        # Axis V = [evecs[0,1], 0, evecs[1,1]]
-        
         for x in [min_xz[0], max_xz[0]]:
             for z in [min_xz[1], max_xz[1]]:
-                # Map back from 2D PCA space to World XZ
                 pt_xz = np.dot(np.array([x, z]), evecs.T) + center_xz
-                
-                # Bottom cap
-                corners.append([pt_xz[0], y_min, pt_xz[1]])
-                # Top cap
-                corners.append([pt_xz[0], y_max, pt_xz[1]])
-                
+                corners.append([pt_xz[0], y_min, pt_xz[1]])  # bottom
+                corners.append([pt_xz[0], y_max, pt_xz[1]])  # top
+
         return corners
 
     def load_graph(self, filename="scene_graph_buildings.json"):
@@ -422,7 +742,7 @@ class SplatSceneGraph:
         
         for obj in tqdm(self.objects):
             # Lower threshold to 500 to catch cars/trees
-            if obj.get('area', 0) < 500: 
+            if obj.get('area', 0) < 100: 
                 continue
 
             # 1. Geometric Analysis
@@ -453,6 +773,12 @@ class SplatSceneGraph:
                 vlm_result = analyze_building_crop(crop_path)
                 
                 if vlm_result:
+                    if isinstance(vlm_result, list):
+                        if len(vlm_result) > 0:
+                            vlm_result = vlm_result[0]
+                        else:
+                            vlm_result = {}
+                            
                     obj_type = vlm_result.get('object_type', 'Unknown')
                     # Fallback for old prompt format
                     if 'is_building' in vlm_result and 'object_type' not in vlm_result:
@@ -463,6 +789,7 @@ class SplatSceneGraph:
                         'stories_visual': vlm_result.get('stories_visual', 0),
                         'stories_estimated_geo': estimated_stories_geo,
                         'usage': vlm_result.get('usage', 'Unknown'),
+                        'estimated_occupants': vlm_result.get('estimated_occupants', 0),
                         'description': vlm_result.get('description', '')
                     }
                     print(f" ID {obj['id']}: {obj_type} ({vlm_result.get('usage', '')})")
@@ -511,8 +838,31 @@ class SplatSceneGraph:
         self.objects = root_objects
 
     def save_graph(self, filename="scene_graph.json"):
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.intc, np.intp, np.int8,
+                                    np.int16, np.int32, np.int64, np.uint8,
+                                    np.uint16, np.uint32, np.uint64)):
+                    return int(obj)
+                elif isinstance(obj, (np.float16, np.float32, np.float64)):
+                    return float(obj)
+                elif isinstance(obj, (np.ndarray,)):
+                    return obj.tolist()
+                return json.JSONEncoder.default(self, obj)
+
         output_path = os.path.join(self.output_dir, filename)
+        
+        data = {
+            "metadata": {
+                "dataset_path": self.dataset_path,
+                "model_path": self.model_path,
+                "object_count": len(self.objects)
+            },
+            "objects": self.objects
+        }
+        
         with open(output_path, 'w') as f:
-            json.dump({'objects': self.objects}, f, indent=4)
-        print(f"Saved scene graph to {output_path}")
+            json.dump(data, f, indent=4, cls=NumpyEncoder)
+        
+        print(f"Scene graph saved to {output_path}")
 

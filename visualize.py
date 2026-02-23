@@ -125,7 +125,36 @@ def main():
         opacities=opacities,
         covariances=covariances
     )
-    
+
+    # -- Auto-center camera on the Gaussian cloud --
+    # Compute scene centroid and a sensible viewing distance.
+    scene_centroid = xyz.mean(axis=0).astype(float)   # (3,)
+    scene_std      = xyz.std(axis=0).mean()
+    view_dist      = float(max(scene_std * 3.0, 1.0))
+
+    # Look-at vector: position camera behind+above the centroid.
+    import math
+    cam_position = (
+        float(scene_centroid[0]),
+        float(scene_centroid[1] - view_dist),
+        float(scene_centroid[2] + view_dist * 0.5),
+    )
+    # Look down the -Y axis (common for 3DGS scenes captured from above/front)
+    # wxyz quaternion for looking from cam_position toward scene_centroid
+    look_dir = np.array(scene_centroid) - np.array(cam_position)
+    look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-8)
+
+    print(f"Scene centroid: {scene_centroid}  |  cam_position: {cam_position}")
+
+    @server.on_client_connect
+    def _on_client(client):
+        """Teleport each new client camera to look at the scene."""
+        client.camera.look_at(
+            position=cam_position,
+            target=tuple(float(v) for v in scene_centroid),
+            up=(0.0, 0.0, 1.0),
+        )
+
     # Splat Click Logic
     def attach_splat_click(handle):
         @handle.on_click
@@ -277,7 +306,16 @@ def main():
         options=["RGB", "Segmentation"],
         initial_value="RGB"
     )
-    
+
+    @server.gui.add_button("⌖ Center View", hint="Jump camera to scene center").on_click
+    def _(_):
+        for client in server.get_clients().values():
+            client.camera.look_at(
+                position=cam_position,
+                target=tuple(float(v) for v in scene_centroid),
+                up=(0.0, 0.0, 1.0),
+            )
+
     show_boxes_checkbox = server.gui.add_checkbox(
         "Show Bounding Boxes",
         initial_value=True
@@ -461,90 +499,43 @@ def main():
     best_obj_indices = None
     best_obj_scores = None
     
-    segmentation_colors = colors.copy()
-    
-    if gaussian_features is not None and obj_features_list:
-        obj_features_np = np.stack(obj_features_list) # (K, D)
-        obj_centroids_np = np.array(obj_centroids_list) # (K, 3)
-        
-        # Compute on GPU if possible
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Computing assignment on {device}...")
-        
-        # Convert to torch
-        # g_feats_th = torch.from_numpy(gaussian_features).to(device) # Too large for VRAM
-        o_feats_th = torch.from_numpy(obj_features_np).float().to(device)
-        
-        g_xyz_th = torch.from_numpy(xyz).float().to(device)
-        o_centroids_th = torch.from_numpy(obj_centroids_np).float().to(device)
-        
-        N = gaussian_features.shape[0]
-        K = o_feats_th.shape[0]
-        
-        best_obj_indices = np.zeros(N, dtype=np.int32)
-        best_obj_scores = np.zeros(N, dtype=np.float32)
-        
-        # Also compute segmentation colors on the fly
-        np.random.seed(42)
-        obj_color_map = np.random.rand(K, 3)
-        
-        chunk_size = 10000 # Smaller chunk size for distance matrix
-        
-        # Spatial Weight: How much does distance penalty matter?
-        # Similarity is [0, 1].
-        # Distance is in meters (e.g., 0 to 10).
-        # We want to penalize far away objects.
-        # Score = Sim - (Dist * weight)
-        # Score = Sim - (Dist * weight)
-        # Compromise: 0.5 (Balance)
-        spatial_weight = 0.5 
-        
-        for i in range(0, N, chunk_size):
-            g_feat_chunk_np = gaussian_features[i:i+chunk_size]
-            g_feat_chunk = torch.from_numpy(g_feat_chunk_np).to(device)
-            g_xyz_chunk = g_xyz_th[i:i+chunk_size]
-            
-            # 1. Feature Similarity (B, K)
-            sim_chunk = g_feat_chunk @ o_feats_th.T
-            
-            # 2. Spatial Distance (B, K)
-            # dist = sqrt((g - o)^2)
-            # Expand dims: (B, 1, 3) - (1, K, 3)
-            dist_chunk = torch.cdist(g_xyz_chunk, o_centroids_th)
-            
-            # 3. Combined Score
-            # We want high similarity and low distance.
-            # Score = Sim - (Dist * weight)
-            score_chunk = sim_chunk - (dist_chunk * spatial_weight)
-            
-            # 4. Argmax
-            best_idx = torch.argmax(score_chunk, dim=1)
-            best_score = torch.max(score_chunk, dim=1).values
-            
-            # For background thresholding, we should look at the RAW similarity of the winner, 
-            # not the penalized score (which could be negative).
-            # Let's retrieve the raw similarity of the winner.
-            # gather: (B, K) -> (B, 1)
-            raw_sim_of_winner = torch.gather(sim_chunk, 1, best_idx.unsqueeze(1)).squeeze(1)
-            
-            # Save to CPU
-            best_obj_indices[i:i+chunk_size] = best_idx.cpu().numpy()
-            best_obj_scores[i:i+chunk_size] = raw_sim_of_winner.cpu().numpy()
-            
-            # Segmentation Colors
-            mask = raw_sim_of_winner > 0.6 # Still use threshold for "is this anything?"
-            
-            chunk_colors = obj_color_map[best_idx.cpu().numpy()]
-            chunk_colors[~mask.cpu().numpy()] = [0.5, 0.5, 0.5]
-            segmentation_colors[i:i+chunk_size] = chunk_colors
-            
-            # Free chunk memory
-            del g_feat_chunk, sim_chunk, dist_chunk, score_chunk, best_idx, best_score, raw_sim_of_winner
-            
-        # Clean up GPU
-        del o_feats_th, g_xyz_th, o_centroids_th
-        torch.cuda.empty_cache()
-        
+    # Build segmentation colors DIRECTLY from point_indices stored in the JSON.
+    # This faithfully reflects the tight assignments computed by the pipeline
+    # (reassign_points_by_feature + DBSCAN clean) rather than re-running a loose
+    # global cosine-similarity pass over all 1.1M Gaussians.
+    N = len(xyz)
+    segmentation_colors = np.full((N, 3), 0.35, dtype=np.float32)  # dark grey = unassigned
+    best_obj_indices = np.full(N, -1, dtype=np.int32)
+    best_obj_scores  = np.zeros(N, dtype=np.float32)
+
+    np.random.seed(42)
+    K_vis = len(obj_idx_to_id)
+    obj_color_map = np.random.rand(max(K_vis, 1), 3).astype(np.float32)
+    # Make colors vivid (avoid dark shades)
+    obj_color_map = obj_color_map * 0.7 + 0.3
+
+    def assign_seg_colors_from_json(obj_list):
+        """Walk the object list (inc. children) and paint point_indices."""
+        for obj in obj_list:
+            oid  = obj['id']
+            idxs = obj.get('point_indices', [])
+            if not idxs:
+                assign_seg_colors_from_json(obj.get('children', []))
+                continue
+            local_k = obj_id_to_idx.get(oid, -1)
+            if local_k < 0:
+                assign_seg_colors_from_json(obj.get('children', []))
+                continue
+            arr = np.asarray(idxs, dtype=np.int64)
+            arr = arr[arr < N]  # guard against stale indices
+            segmentation_colors[arr] = obj_color_map[local_k]
+            best_obj_indices[arr] = local_k
+            best_obj_scores[arr]  = 1.0  # fully assigned
+            assign_seg_colors_from_json(obj.get('children', []))
+
+    assign_seg_colors_from_json(objects)
+    assigned_count = (best_obj_indices >= 0).sum()
+    print(f"Segmentation colors: {assigned_count} / {N} Gaussians assigned from JSON point_indices.")
     print("Assignment computed.")
     
     
@@ -657,8 +648,8 @@ def main():
     object_masks = {}
     if best_obj_indices is not None:
         for oid, idx in obj_id_to_idx.items():
-            # Mask: Winner is this object AND score > 0.6
-            mask = (best_obj_indices == idx) & (best_obj_scores > 0.6)
+            # Mask: this Gaussian was assigned to this object in the JSON
+            mask = (best_obj_indices == idx) & (best_obj_scores > 0.5)
             object_masks[oid] = mask
     print("Masks computed.")
     

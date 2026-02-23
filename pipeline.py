@@ -47,8 +47,13 @@ def main():
             print(f"Predicting physics for object {obj['id']}...")
             physics_props = predictor.predict(obj)
             if physics_props:
-                obj['metadata'] = physics_props.get('metadata', {})
-                obj['usd_physics'] = physics_props.get('usd_physics', {})
+                if isinstance(physics_props, list):
+                    physics_props = physics_props[0] if physics_props else {}
+                if isinstance(physics_props, dict):
+                    obj['metadata'] = physics_props.get('metadata', {})
+                    obj['usd_physics'] = physics_props.get('usd_physics', {})
+                else:
+                    print(f"Unexpected physics type {type(physics_props)}, skipping obj {obj['id']}")
             else:
                 print(f"Failed to predict physics for object {obj['id']}")
     else:

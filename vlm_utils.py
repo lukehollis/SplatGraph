@@ -16,12 +16,9 @@ def analyze_building_crop(image_path, api_key=None):
     api_key = os.environ.get("OPENROUTER_API_KEY")
     base_url = None
     
-    if not api_key:
-        # Check for OpenRouter
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if api_key:
-            base_url = "https://openrouter.ai/api/v1"
-            print("Using OpenRouter API key.")
+    if api_key and api_key.startswith("sk-or-"):
+         base_url = "https://openrouter.ai/api/v1"
+         print("Using OpenRouter API key.")
 
     if not api_key:
         print("Warning: No OPENROUTER_API_KEY found. Skipping VLM analysis.")
@@ -37,7 +34,8 @@ def analyze_building_crop(image_path, api_key=None):
     1. Object Type: Building, Tree, Car, Usage, or Other.
     2. Approximate number of stories (visual count) - 0 if not a building.
     3. Likely usage (Residential, Commercial, Office, Industrial, Mixed-use, or Other) - Only for buildings.
-    4. A brief 1-sentence description.
+    4. Estimated number of occupants (based on size/type) - 0 if not a building.
+    5. A brief 1-sentence description.
 
     Respond in JSON format:
     {
@@ -45,6 +43,7 @@ def analyze_building_crop(image_path, api_key=None):
         "is_building": boolean,
         "stories_visual": int,
         "usage": "string",
+        "estimated_occupants": int,
         "description": "string"
     }
     """
